@@ -41,7 +41,7 @@ jobs:
       - name: toolchain (rust 1.85, pinned by rust-toolchain.toml)
         run: |
           set -e
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.85
           . "$HOME/.cargo/env"
           rustc --version
 
@@ -80,7 +80,10 @@ jobs:
           BIN=$(find . -maxdepth 3 -name 'gozjaro-install' -type f | head -n1)
           [ -n "$BIN" ] || { echo "artifact binary not found"; exit 1; }
           sha256sum "$BIN"
+          # the runner's gh predates --filename/-b: rename the file up front
+          # and use -n for the release notes.
+          mv "$BIN" gozjaro-install-x86_64-linux
           gh release create "$TAG" \
             -t "gozjaro-installer $TAG (x86_64 linux, glibc 2.31)" \
-            -b "Built on debian:bullseye (glibc 2.31), the GozJaro LFS target's glibc. Run on the live system; chroot the target for --root. Source: this tag's commit." \
-            "$BIN" --filename gozjaro-install-x86_64-linux
+            -n "Built on debian:bullseye (glibc 2.31), the GozJaro LFS target's glibc. Run on the live system; chroot the target for --root. Source: this tag's commit." \
+            gozjaro-install-x86_64-linux
