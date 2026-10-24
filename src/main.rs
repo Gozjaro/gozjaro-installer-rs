@@ -5,7 +5,7 @@
 //! destructive path already requires an explicit `--yes` + root, which the
 //! TUI will call through the same `Installer` API.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gozjaro_installer::disks;
 use gozjaro_installer::installer::Installer;

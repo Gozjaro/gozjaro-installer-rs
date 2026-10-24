@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "GozJaro disk installer — rust rewrite of the python gozjaro-install backend"
 license = "GPL-3.0-or-later"
+autobins = false
 
 [dependencies]
 anyhow = "1"
@@ -16,3 +17,9 @@ serde_json = "1"
 [profile.release]
 lto = true
 strip = "symbols"
+
+[[bin]]
+# Same on-disk name as the python shim: /usr/bin/gozjaro-install, so stage
+# 77's swap is a drop-in (the share/ package and builder stay).
+name = "gozjaro-install"
+path = "src/main.rs"
