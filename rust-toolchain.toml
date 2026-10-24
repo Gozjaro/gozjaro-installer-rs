@@ -1,0 +1,7 @@
+[toolchain]
+# Pin the toolchain: the release binary must be buildable anywhere from the
+# pinned source. Keep the channel old enough to RUN on the build container's
+# glibc (debian:bullseye = 2.31; rustc >= 1.9x needs a newer host glibc) while
+# staying >= every dependency's MSRV. See .github/workflows/release.yml.
+channel = "1.85"
+profile = "minimal"

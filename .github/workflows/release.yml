@@ -1,0 +1,82 @@
+name: build-release
+
+# Builds the installer inside a debian:bullseye container so the release
+# binary links against glibc 2.31 — exactly the GozJaro LFS target (already
+# verified on the live system). Published to GitHub Releases; the GozJaro
+# bootstrap pins the asset by sha256.
+#
+# bullseye is in long-term archive: the docker image still ships the old
+# deb.debian.org sources, so the apt source list is pointed at
+# archive.debian.org first.
+
+on:
+  push:
+    tags: ["installer-*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "release tag (e.g. installer-v1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:bullseye   # glibc 2.31 == GozJaro LFS target glibc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apt (archive.debian.org)
+        run: |
+          set -e
+          printf '%s\n' \
+            'deb [trusted=yes] http://archive.debian.org/debian bullseye main' \
+            'deb [trusted=yes] http://archive.debian.org/debian-security bullseye-security main' \
+            > /etc/apt/sources.list
+          apt-get update -o Acquire::Check-Valid-Until=false
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl
+
+      - name: toolchain (rust 1.85, pinned by rust-toolchain.toml)
+        run: |
+          set -e
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          rustc --version
+
+      - name: test + build
+        run: |
+          set -e
+          . "$HOME/.cargo/env"
+          cargo test --locked
+          cargo build --release --locked
+          sha256sum target/release/gozjaro-installer
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gozjaro-install-x86_64-linux
+          path: target/release/gozjaro-installer
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest     # gh is preinstalled here (not in the bullseye container)
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gozjaro-install-x86_64-linux
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${{ github.event.inputs.tag }}"
+          [ -n "$TAG" ] || TAG="${GITHUB_REF_NAME}"
+          # idempotent: drop any previous release for the same tag
+          gh release delete -R Gozjaro/gozjaro-installer-rs "$TAG" --cleanup-tag --yes || true
+          gh release create -R Gozjaro/gozjaro-installer-rs "$TAG" \
+            -t "gozjaro-installer $TAG (x86_64 linux, glibc 2.31)" \
+            -b "Built on debian:bullseye (glibc 2.31), the GozJaro LFS target's glibc. Run on the live system; chroot the target for --root. Source: this tag's commit." \
+            gozjaro-install-x86_64-linux/gozjaro-install-x86_64-linux
