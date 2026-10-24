@@ -1,0 +1,14 @@
+/Users/weepingdogel/Projects/gozjaro-installer-rs/target/release/deps/serde-329b544e982b0288.d: /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/weepingdogel/Projects/gozjaro-installer-rs/target/release/build/serde-0823354f3c1b68e5/out/private.rs
+
+/Users/weepingdogel/Projects/gozjaro-installer-rs/target/release/deps/libserde-329b544e982b0288.rlib: /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/weepingdogel/Projects/gozjaro-installer-rs/target/release/build/serde-0823354f3c1b68e5/out/private.rs
+
+/Users/weepingdogel/Projects/gozjaro-installer-rs/target/release/deps/libserde-329b544e982b0288.rmeta: /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/weepingdogel/Projects/gozjaro-installer-rs/target/release/build/serde-0823354f3c1b68e5/out/private.rs
+
+/Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/weepingdogel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/weepingdogel/Projects/gozjaro-installer-rs/target/release/build/serde-0823354f3c1b68e5/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/weepingdogel/Projects/gozjaro-installer-rs/target/release/build/serde-0823354f3c1b68e5/out
