@@ -51,12 +51,12 @@ jobs:
           . "$HOME/.cargo/env"
           cargo test --locked
           cargo build --release --locked
-          sha256sum target/release/gozjaro-installer
+          sha256sum target/release/gozjaro-install
 
       - uses: actions/upload-artifact@v4
         with:
           name: gozjaro-install-x86_64-linux
-          path: target/release/gozjaro-installer
+          path: target/release/gozjaro-install
 
   release:
     needs: build
@@ -76,7 +76,10 @@ jobs:
           [ -n "$TAG" ] || TAG="${GITHUB_REF_NAME}"
           # idempotent: drop any previous release for the same tag
           gh release delete -R Gozjaro/gozjaro-installer-rs "$TAG" --cleanup-tag --yes || true
+          BIN=$(find . -maxdepth 3 -name 'gozjaro-install' -type f | head -n1)
+          [ -n "$BIN" ] || { echo "artifact binary not found"; exit 1; }
+          sha256sum "$BIN"
           gh release create -R Gozjaro/gozjaro-installer-rs "$TAG" \
             -t "gozjaro-installer $TAG (x86_64 linux, glibc 2.31)" \
             -b "Built on debian:bullseye (glibc 2.31), the GozJaro LFS target's glibc. Run on the live system; chroot the target for --root. Source: this tag's commit." \
-            gozjaro-install-x86_64-linux/gozjaro-install-x86_64-linux
+            "$BIN" --filename gozjaro-install-x86_64-linux
