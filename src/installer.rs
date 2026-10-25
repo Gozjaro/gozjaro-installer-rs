@@ -11,6 +11,7 @@
 use crate::disks;
 use crate::plan;
 use crate::state::{self, InstallState};
+use std::ffi::CString;
 use anyhow::{anyhow, bail, Context, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -20,7 +21,7 @@ use std::process::Command;
 /// python3 itself and plus the rust binary — the host checks are the same).
 pub const REQUIRED_HOST_TOOLS: &[&str] = &[
     "sgdisk", "mkfs.vfat", "mkfs.ext4", "blkid", "wipefs", "rsync", "cpio",
-    "grub-install", "partprobe", "efibootmgr",
+    "grub-install", "efibootmgr",
 ];
 
 pub struct LogLine {
@@ -87,6 +88,50 @@ impl Installer {
             bail!("{} failed (rc={rc}):\n{tail}", args[0]);
         }
         Ok((rc, text))
+    }
+
+    /// Make the kernel re-read the partition table so the new partition
+    /// device nodes appear — the job the external `partprobe` (util-linux)
+    /// used to do. The GozJaro tree intentionally ships no util-linux, so
+    /// the installer does it natively: util-linux' partprobe itself is
+    /// `ioctl(fd, BLKPG)` with a `BLKRRPART` fallback, and both ioctls are
+    /// arch-independent (_IO(0x12, 0x70) / _IO(0x12, 0x74) in
+    /// asm/blkdev.h, same number on x86_64 and aarch64).
+    ///
+    /// Best-effort, matching partprobe's exit-code contract (non-zero can
+    /// mean "no partitions to re-read" on a device): the hard gate is the
+    /// partition-device poll in `partition_and_format`, which still bails
+    /// if the nodes never appear.
+    fn revalidate_partitions(&mut self, dev: &str) -> Result<()> {
+        self.logl("cmd", format!("$ revalidate {dev} (kernel BLKPG/BLKRRPART, native)"));
+        self.audit.push(vec!["revalidate".into(), dev.to_string()]);
+        if self.dry_run {
+            return Ok(());
+        }
+        let cdev = CString::new(dev).map_err(|e| anyhow!("invalid device name {dev}: {e}"))?;
+        let fd = unsafe { libc::open(cdev.as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            bail!("revalidate {dev}: cannot open {dev}: {e}");
+        }
+        const BLKPG: libc::c_ulong = 0x1270;
+        const BLKRRPART: libc::c_ulong = 0x1274;
+        let ok = if unsafe { libc::ioctl(fd, BLKPG) } < 0
+            && unsafe { libc::ioctl(fd, BLKRRPART) } < 0
+        {
+            false
+        } else {
+            true
+        };
+        let _ = unsafe { libc::close(fd) };
+        if !ok {
+            let e = std::io::Error::last_os_error();
+            self.logl(
+                "warn",
+                format!("revalidate {dev}: kernel rejected BLKPG/BLKRRPART ({e}); device nodes may still appear on next access"),
+            );
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -195,8 +240,9 @@ impl Installer {
             let argv: Vec<&str> = cmd.split_whitespace().collect();
             self.exec_cmd(&argv, true)?;
         }
-        // make the kernel see the new table
-        self.exec_cmd(&["partprobe", dev], false)?;
+        // make the kernel see the new table (native BLKPG, replaces the
+        // external partprobe that the minimal tree does not ship)
+        self.revalidate_partitions(dev)?;
         if !self.dry_run {
             for _ in 0..10 {
                 if Path::new(&root_dev).exists() && Path::new(&esp_dev).exists() {
@@ -206,7 +252,7 @@ impl Installer {
             }
             for d in [&esp_dev, &root_dev] {
                 if !Path::new(d).exists() {
-                    bail!("partition {d} did not appear after partprobe");
+                    bail!("partition {d} did not appear after revalidate");
                 }
             }
         }
@@ -585,7 +631,7 @@ mod tests {
     use super::*;
 
     /// Dry-run partitioning: no host side effects, audit records the exact
-    /// command order (wipefs → sgdisk zap → sgdisk new ×2 → partprobe →
+    /// command order (wipefs → sgdisk zap → sgdisk new ×2 → revalidate →
     /// mkfs.vfat → mkfs.ext4 → blkid ×2), and the "did not appear" error
     /// cannot fire (device wait is dry-gated).
     #[test]
@@ -600,8 +646,8 @@ mod tests {
             .collect();
         let pos = |t: &str| firsts.iter().position(|x| x == t).unwrap_or(usize::MAX);
         assert!(pos("wipefs") < pos("sgdisk"));
-        assert!(pos("sgdisk") < pos("partprobe"));
-        assert!(pos("partprobe") < pos("mkfs.vfat"));
+        assert!(pos("sgdisk") < pos("revalidate"));
+        assert!(pos("revalidate") < pos("mkfs.vfat"));
         assert!(pos("mkfs.vfat") < pos("mkfs.ext4"));
         assert!(pos("mkfs.ext4") < pos("blkid"));
         // the sgdisk zap is the very first sgdisk invocation
