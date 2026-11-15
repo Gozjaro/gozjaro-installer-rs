@@ -261,19 +261,42 @@ pub fn sysfs_block_path(dev: &str) -> std::path::PathBuf {
     std::path::Path::new("/sys/block").join(name)
 }
 
-/// True when `dev` is a partition, not a whole disk: partition sysfs
-/// entries carry a `range` attribute (first-sector:last-sector), whole
-/// disks do not. Returns false when the device has no sysfs entry.
+/// True when `dev` is a partition, not a whole disk. The `start`
+/// attribute (first LBA) is only created for partition devices, on
+/// every kernel generation we target; whole disks never have it.
+/// (Kernel 7.x moved per-partition attrs to /sys/class/block/<n>/, so
+/// check there — /sys/block/<n> is unreliable on the new layout.)
 pub fn is_partition(dev: &str) -> bool {
-    sysfs_block_path(dev).join("range").is_file()
+    let name = std::path::Path::new(dev)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dev.to_string());
+    std::path::Path::new("/sys/class/block")
+        .join(&name)
+        .join("start")
+        .is_file()
 }
 
 /// Device size in 512-byte sectors, read straight from sysfs — no shell
 /// (the dry-run audit mode makes `exec_cmd` return empty output, which
-/// used to zero the sector count and kill GPT planning).
+/// used to zero the sector count and kill GPT planning). Tries
+/// /sys/block/<n>/size first, falls back to /sys/class/block/<n>/size
+/// (kernel 7.x drops per-partition sysfs dirs under /sys/block).
 #[cfg(target_os = "linux")]
 pub fn read_device_sectors(dev: &str) -> Result<u64> {
-    let p = sysfs_block_path(dev).join("size");
+    let name = std::path::Path::new(dev)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dev.to_string());
+    let p1 = std::path::Path::new("/sys/block").join(&name).join("size");
+    let p2 = std::path::Path::new("/sys/class/block").join(&name).join("size");
+    let p = if p1.is_file() {
+        p1
+    } else if p2.is_file() {
+        p2
+    } else {
+        bail!("{dev}: no sysfs size attribute (device missing or unreadable)")
+    };
     let raw = std::fs::read_to_string(p.as_os_str())
         .with_context(|| format!("reading {}", p.display()))?;
     let n = total_sectors_from_sysfs(&raw);

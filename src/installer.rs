@@ -116,8 +116,11 @@ impl Installer {
         }
         const BLKPG: libc::c_ulong = 0x1270;
         const BLKRRPART: libc::c_ulong = 0x1274;
-        let ok = if unsafe { libc::ioctl(fd, BLKPG) } < 0
-            && unsafe { libc::ioctl(fd, BLKRRPART) } < 0
+        // NB: recent libc types the ioctl request as `Ioctl` (u64 on gnu,
+        // narrower on some musl targets); the numeric constants above
+        // convert losslessly on all of them.
+        let ok = if unsafe { libc::ioctl(fd, BLKPG.try_into().unwrap()) } < 0
+            && unsafe { libc::ioctl(fd, BLKRRPART.try_into().unwrap()) } < 0
         {
             false
         } else {
@@ -179,24 +182,12 @@ impl Installer {
         let medium = self.find_live_medium()?;
         match medium {
             Some(dev) => {
-                if self.dry_run {
-                    // no real mounts in dry-run: the planner just needs the
-                    // verified medium + its expected materialized paths
-                    self.state.iso = state::ISO_MOUNT.into();
-                    self.state.src = state::SRC_MOUNT.into();
-                    let (iso, src) = (state::ISO_MOUNT, state::SRC_MOUNT);
-                    self.logl(
-                        "info",
-                        format!(
-                            "{dev} verified read-only (isofs label {}); dry-run keeps \
-                             {iso} + {src} audit-only",
-                            state::LIVE_LABEL
-                        ),
-                    );
-                    Ok(())
-                } else {
-                    self.materialize_live_medium(&dev)
-                }
+                // Read-only materialization, in both modes: the planner
+                // needs the source tree (kernel listing, ISO copy) and a
+                // ro mount of the medium never writes to it. Real runs
+                // additionally keep the mount for later phases; dry-run
+                // unmounts it on exit like any other.
+                self.materialize_live_medium(&dev)
             }
             None => bail!(
                 "cannot find the live medium (isofs label {} on a mounted or \
@@ -236,22 +227,55 @@ impl Installer {
         Ok(None)
     }
 
+    /// Run argv in BOTH modes (real and dry). Reserved for the read-only,
+    /// idempotent operations the planner itself needs even in dry-run:
+    /// medium materialization, stale-mount cleanup, and their teardown.
+    /// Every writing operation goes through `exec_cmd` (audit-only in
+    /// dry-run).
+    fn run_cmd(&mut self, argv: &[&str]) -> Result<(i32, String)> {
+        self.logl("cmd", format!("$ {} (direct)", argv.join(" ")));
+        let out = Command::new(argv[0])
+            .args(&argv[1..])
+            .output()
+            .with_context(|| format!("failed to run {}", argv[0]))?;
+        let code = out.status.code().unwrap_or(-1);
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.trim().is_empty() {
+            text.push_str(&format!("\n{err}"));
+        }
+        Ok((code, text))
+    }
+
     /// Real-run materialization: clear stale stacks from earlier failed runs,
     /// mount the medium at /mnt/iso, verify the squashfs, loop-mount /mnt/src.
     fn materialize_live_medium(&mut self, dev: &str) -> Result<()> {
         self.clear_stale_mounts();
         std::fs::create_dir_all(state::ISO_MOUNT)
             .context(format!("cannot create {}", state::ISO_MOUNT))?;
-        self.exec_cmd(&["mount", "-o", "ro", dev, state::ISO_MOUNT], true)?;
+        let (code, err) = self.run_cmd(&["mount", "-o", "ro", dev, state::ISO_MOUNT])?;
+        if code != 0 {
+            bail!("mount {dev} failed (rc={code}): {err}");
+        }
         self.live_unmounts.push(state::ISO_MOUNT.to_string());
         let squash = format!("{}/live/filesystem.squashfs", state::ISO_MOUNT);
         if !Path::new(&squash).is_file() {
-            let _ = self.exec_cmd(&["umount", state::ISO_MOUNT], false);
+            let _ = self.run_cmd(&["umount", state::ISO_MOUNT]);
+            self.live_unmounts.clear();
             bail!("{dev} is not the Gozjaro live medium (no {squash})");
         }
         std::fs::create_dir_all(state::SRC_MOUNT)
             .context(format!("cannot create {}", state::SRC_MOUNT))?;
-        self.exec_cmd(&["mount", "-o", "ro,loop", &squash, state::SRC_MOUNT], true)?;
+        let (code, err) = self.run_cmd(&[
+            "mount",
+            "-o",
+            "ro,loop",
+            &squash,
+            state::SRC_MOUNT,
+        ])?;
+        if code != 0 {
+            bail!("mount {squash} failed (rc={code}): {err}");
+        }
         self.live_unmounts.push(state::SRC_MOUNT.to_string());
         self.state.src = state::SRC_MOUNT.into();
         self.state.iso = state::ISO_MOUNT.into();
@@ -270,7 +294,7 @@ impl Installer {
         for mp in [state::ISO_MOUNT, state::SRC_MOUNT] {
             let n = Self::stale_mount_count(mp).min(10);
             for _ in 0..n {
-                let Ok((code, _)) = self.exec_cmd(&["umount", mp], false) else {
+                let Ok((code, _)) = self.run_cmd(&["umount", mp]) else {
                     break;
                 };
                 if code != 0 {
@@ -452,17 +476,24 @@ impl Installer {
     // ------------------------------------------------------------------
 
     pub fn install_kernel_and_config(&mut self, hostname: &str, tz: &str) -> Result<()> {
-        let moddir = format!("{}/lib/modules", state::ROOT_MOUNT);
+        // Kernel versions are enumerated from the tree that actually has
+        // them: the installed target in real mode, the (read-only mounted)
+        // live source in dry-run. The dry-run target is still empty, so
+        // reading it here is what used to bail with "no kernel under
+        // /mnt/install/lib/modules".
+        let moddir = if self.dry_run {
+            format!("{}/lib/modules", self.state.src)
+        } else {
+            format!("{}/lib/modules", state::ROOT_MOUNT)
+        };
         let mut kvers: Vec<String> = Vec::new();
-        if !self.dry_run {
-            if !Path::new(&moddir).is_dir() {
-                bail!("no {moddir} in the target (rsync incomplete?)");
-            }
-            for entry in std::fs::read_dir(&moddir)? {
-                let entry = entry?;
-                if entry.path().is_dir() {
-                    kvers.push(entry.file_name().to_string_lossy().into_owned());
-                }
+        if !Path::new(&moddir).is_dir() {
+            bail!("no {moddir} ({})", if self.dry_run { "source" } else { "target" });
+        }
+        for entry in std::fs::read_dir(&moddir)? {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                kvers.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
         let kver = plan::latest_kver(&kvers.iter().map(String::as_str).collect::<Vec<_>>())
@@ -665,7 +696,14 @@ impl Installer {
         self.mounts.clear();
         let live: Vec<String> = self.live_unmounts.clone();
         for mnt in live.iter().rev() {
-            self.exec_cmd(&["umount", mnt], false)?;
+            if self.dry_run {
+                // medium materialization happened via real mounts in both
+                // modes; in dry-run exec_cmd only audits, so tear down the
+                // live mounts directly (best effort, already unmounted is OK)
+                let _ = self.run_cmd(&["umount", &mnt]);
+            } else {
+                self.exec_cmd(&["umount", &mnt], false)?;
+            }
         }
         self.live_unmounts.clear();
         self.exec_cmd(&["sync"], true)?;
