@@ -418,6 +418,16 @@ impl Installer {
             }
         }
 
+        // Record the on-disk GPT/PTUUID so install_grub can pin the NVRAM
+        // entry to THIS disk (efibootmgr matches by name, so a second
+        // Gozjaro install would otherwise steal the "Gozjaro" entry).
+        if !self.dry_run {
+            let (_, pu) =
+                self.exec_cmd(&["blkid", "-s", "PTUUID", "-o", "value", dev], false)?;
+            self.state.gpt_uuid = pu.trim().to_string();
+            self.logl("info", format!("gpt uuid={}", self.state.gpt_uuid));
+        }
+
         self.logl(
             "step",
             format!("formatting {esp_dev} (vfat) and {root_dev} (ext4)"),
@@ -685,7 +695,12 @@ impl Installer {
                 &["chroot", state::ROOT_MOUNT, "efibootmgr", "-v"],
                 false,
             )?;
-            if let Some(entry) = plan::find_gozjaro_boot_entry(&out) {
+            let gpt_uuid = if s.gpt_uuid.is_empty() {
+                None
+            } else {
+                Some(s.gpt_uuid.as_str())
+            };
+            if let Some(entry) = plan::find_gozjaro_boot_entry(&out, gpt_uuid) {
                 let _ = self.exec_cmd(
                     &["chroot", state::ROOT_MOUNT, "efibootmgr", "-b", &entry],
                     false,

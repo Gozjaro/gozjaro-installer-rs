@@ -66,9 +66,27 @@ pub fn grub_commands(s: &InstallState) -> Vec<String> {
 /// entry name (`Boot0001*`), so the pattern must allow an optional `*`
 /// before the whitespace — the python original's regex missed this and
 /// would have failed on every real UEFI boot.
-pub fn find_gozjaro_boot_entry(efibootmgr_out: &str) -> Option<String> {
-    let re = Regex::new(r"(Boot[0-9A-F]+)\*?\s+Gozjaro").ok()?;
-    re.captures(efibootmgr_out)?.get(1).map(|m| m.as_str().to_string())
+///
+/// efibootmgr matches entries by NAME, so a second Gozjaro install
+/// silently re-points the single "Gozjaro" entry at the new disk. When
+/// `gpt_uuid` is known (the target disk's GPT PTUUID, which efibootmgr
+/// embeds in the HD() device path), only an entry whose path carries it
+/// is accepted — otherwise the first name match is used (dry-run has no
+/// on-disk table to read, so the uuid stays unknown).
+pub fn find_gozjaro_boot_entry(efibootmgr_out: &str, gpt_uuid: Option<&str>) -> Option<String> {
+    let re = Regex::new(r"Boot[0-9A-F]+").ok()?;
+    let uuid = gpt_uuid.map(|u| u.to_lowercase());
+    efibootmgr_out.lines().find_map(|line| {
+        if !line.contains("Gozjaro") {
+            return None;
+        }
+        let id = re.find(line)?.as_str().to_string();
+        match &uuid {
+            Some(u) if line.to_lowercase().contains(u.as_str()) => Some(id),
+            Some(_) => None, // name match on another disk's entry; keep looking
+            None => Some(id),
+        }
+    })
 }
 
 /// Pick the newest kernel version dir under /lib/modules. Mirrors the
@@ -139,8 +157,24 @@ mod tests {
                    Boot0000*  Linuxboot   HD(1,80,60,1a6e9d80,0x6450)\n\
                    Boot0001*  Gozjaro    HD(1,80,60,1a6e9d80,0x6450)\n\
                    Boot0002   UEFI: USB\n";
-        assert_eq!(find_gozjaro_boot_entry(out).as_deref(), Some("Boot0001"));
-        assert_eq!(find_gozjaro_boot_entry("no entries here"), None);
+        assert_eq!(
+            find_gozjaro_boot_entry(out, None).as_deref(),
+            Some("Boot0001")
+        );
+        assert_eq!(find_gozjaro_boot_entry("no entries here", None), None);
+        // with a known GPT uuid, an entry pointing at another disk is
+        // skipped and the matching one wins
+        let two = "Boot0005* Gozjaro HD(1,GPT,21e2653c-3615-456e-84ff-3f31866510a9,0x800,0x100000)/\\EFI\\Gozjaro\\grubx64.efi\n\
+                   Boot0006* Gozjaro HD(1,GPT,4a98aa2a-8c4a-4c7f-98a3-4b21fe12cae3,0x800,0x100000)/\\EFI\\Gozjaro\\grubx64.efi\n";
+        assert_eq!(
+            find_gozjaro_boot_entry(two, Some("4a98aa2a-8c4a-4c7f-98a3-4b21fe12cae3"))
+                .as_deref(),
+            Some("Boot0006")
+        );
+        assert_eq!(
+            find_gozjaro_boot_entry(two, Some("no-such-uuid")),
+            None
+        );
     }
 
     #[test]

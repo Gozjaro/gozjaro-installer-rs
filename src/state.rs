@@ -53,6 +53,11 @@ pub struct InstallState {
     /// Populated by check_env().
     pub src: String,
     pub iso: String,
+    /// GPT protective-MBR / PTUUID of the target disk (lowercase). Read
+    /// after partitioning (real mode only). efibootmgr embeds it in the
+    /// HD() device path of the "Gozjaro" entry; used to disambiguate when
+    /// more than one Gozjaro install exists on the machine.
+    pub gpt_uuid: String,
 }
 
 impl InstallState {
