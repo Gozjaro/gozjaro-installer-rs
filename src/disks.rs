@@ -15,6 +15,8 @@
 //! scriptable, and is what LFS ships.
 
 use anyhow::{anyhow, bail, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -25,7 +27,11 @@ pub const LINUX_GUID: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"; // Linux fi
 pub const SECTOR: u64 = 512;
 pub const ESP_START_SECTOR: u64 = 2048; // 1 MiB
 pub const ESP_SIZE_MIB: u64 = 512;
-pub const GPT_TAIL_RESERVE: u64 = 33; // backup GPT + protective MBR, sgdisk reserves it
+pub const GPT_TAIL_RESERVE: u64 = 34; // no partition may use the 33-sector
+                                       // backup-GPT block (entry array + header)
+                                       // at [total-33 .. total-1]; sgdisk
+                                       // rejects a partition ending inside it,
+                                       // so the last partition sector is total-34
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GptLayout {
@@ -60,9 +66,9 @@ pub fn root_start_sector(esp_mib: u64) -> u64 {
     esp_end_sector(esp_mib) + 1
 }
 
-/// Last usable sector for the root partition. sgdisk reserves 33 sectors at
-/// the tail for the backup GPT header + protective MBR; a partition must not
-/// run past total-33.
+/// Last usable sector for the root partition. The GPT reserves a 33-sector
+/// backup block at the tail; sgdisk rejects a partition whose last sector
+/// lands in that block, so a partition must end at or before total-34.
 pub fn root_end_sector(total_sectors: u64) -> Result<u64> {
     if total_sectors == 0 {
         bail!("total_sectors must be positive");
@@ -126,26 +132,44 @@ pub fn zap_commands(disk: &str) -> Vec<String> {
 }
 
 /// Create p1 (ESP) and p2 (root). sgdisk `--new=no:start:end` is inclusive
-/// on both ends; the GUIDs are spelled explicitly so the command is
+/// on both ends; the GUIDs are spelled explicitly so the commands are
 /// self-documenting and independent of sgdisk's keyword table.
+///
+/// Every property is applied in its OWN sgdisk invocation: the sgdisk in
+/// the GozJaro image does not commit when `--new` and `--type`/`--set-boot`
+/// ride on the same invocation (it exits 0 and writes nothing), whereas
+/// plain `--new` and the single-property `-t`/`-c`/`-b` forms each commit
+/// reliably. Verified against the live image's sgdisk build.
 pub fn partition_commands(l: &GptLayout) -> Vec<String> {
+    let d = l.disk.as_str();
     vec![
+        // create both partitions first
         format!(
-            "sgdisk --new={no}:{start}:{end} --type={no}:{guid} --change-name={no}:ESP --set-boot={no} {disk}",
+            "sgdisk --new={no}:{start}:{end} {d}",
             no = l.esp_no,
             start = l.esp_start,
-            end = l.esp_end,
-            guid = l.esp_guid,
-            disk = l.disk
+            end = l.esp_end
         ),
         format!(
-            "sgdisk --new={no}:{start}:{end} --type={no}:{guid} --change-name={no}:root {disk}",
+            "sgdisk --new={no}:{start}:{end} {d}",
             no = l.root_no,
             start = l.root_start,
-            end = l.root_end,
-            guid = l.root_guid,
-            disk = l.disk
+            end = l.root_end
         ),
+        // then attach the properties, one invocation each
+        format!(
+            "sgdisk -t {no}:{guid} {d}",
+            no = l.esp_no,
+            guid = l.esp_guid
+        ),
+        format!("sgdisk -c {no}:ESP {d}", no = l.esp_no),
+        format!("sgdisk -b {no} {d}", no = l.esp_no), // legacy BIOS bootable
+        format!(
+            "sgdisk -t {no}:{guid} {d}",
+            no = l.root_no,
+            guid = l.root_guid
+        ),
+        format!("sgdisk -c {no}:root {d}", no = l.root_no),
     ]
 }
 
@@ -244,10 +268,137 @@ pub fn parse_lsblk_block_devices(raw: &str) -> Vec<DiskInfo> {
         .collect()
 }
 
-/// `blockdev --getsz DEV` prints a single sector count (512-byte units).
-pub fn total_sectors_from_blockdev(raw: &str) -> u64 {
-    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
-    digits.parse().unwrap_or(0)
+/// Parse `/sys/block/<dev>/size` (device size in 512-byte sectors).
+pub fn total_sectors_from_sysfs(raw: &str) -> u64 {
+    raw.trim().parse().unwrap_or(0)
+}
+
+/// `/sys/block` directory for a device node (`/dev/sdX`, `/dev/sdXN`,
+/// `/dev/srN`, `/dev/loopN`, `/dev/nvmeXnYpZ` all live there).
+pub fn sysfs_block_path(dev: &str) -> std::path::PathBuf {
+    let name = std::path::Path::new(dev)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dev.to_string());
+    std::path::Path::new("/sys/block").join(name)
+}
+
+/// True when `dev` is a partition, not a whole disk. The `start`
+/// attribute (first LBA) is only created for partition devices, on
+/// every kernel generation we target; whole disks never have it.
+/// (Kernel 7.x moved per-partition attrs to /sys/class/block/<n>/, so
+/// check there — /sys/block/<n> is unreliable on the new layout.)
+pub fn is_partition(dev: &str) -> bool {
+    let name = std::path::Path::new(dev)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dev.to_string());
+    std::path::Path::new("/sys/class/block")
+        .join(&name)
+        .join("start")
+        .is_file()
+}
+
+/// Device size in 512-byte sectors, read straight from sysfs — no shell
+/// (the dry-run audit mode makes `exec_cmd` return empty output, which
+/// used to zero the sector count and kill GPT planning). Tries
+/// /sys/block/<n>/size first, falls back to /sys/class/block/<n>/size
+/// (kernel 7.x drops per-partition sysfs dirs under /sys/block).
+#[cfg(target_os = "linux")]
+pub fn read_device_sectors(dev: &str) -> Result<u64> {
+    let name = std::path::Path::new(dev)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dev.to_string());
+    let p1 = std::path::Path::new("/sys/block").join(&name).join("size");
+    let p2 = std::path::Path::new("/sys/class/block").join(&name).join("size");
+    let p = if p1.is_file() {
+        p1
+    } else if p2.is_file() {
+        p2
+    } else {
+        bail!("{dev}: no sysfs size attribute (device missing or unreadable)")
+    };
+    let raw = std::fs::read_to_string(p.as_os_str())
+        .with_context(|| format!("reading {}", p.display()))?;
+    let n = total_sectors_from_sysfs(&raw);
+    if n == 0 {
+        bail!("{dev}: sysfs sector size is 0 (device missing or unreadable)");
+    }
+    Ok(n)
+}
+#[cfg(not(target_os = "linux"))]
+pub fn read_device_sectors(_dev: &str) -> Result<u64> {
+    bail!("read_device_sectors needs Linux sysfs")
+}
+
+// --- isofs (ISO 9660) read-only medium verification ------------------------
+//
+// The live medium is verified WITHOUT mounting: the Primary Volume
+// Descriptor sits at logical sector 16 (absolute offset 32 KiB), 2048
+// bytes: type 0x01, magic "CD001", volume label at bytes 40..72.
+
+pub const ISOFS_PVD_OFFSET: u64 = 32_768;
+pub const ISOFS_BLOCK: usize = 2048;
+
+/// Volume label from raw PVD bytes; None on bad magic or empty label.
+pub fn isofs_label_from_pvd(pvd: &[u8]) -> Option<String> {
+    if pvd.len() < ISOFS_BLOCK || pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        return None;
+    }
+    let label = pvd[40..72]
+        .iter()
+        .map(|b| *b as char)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+/// Read-only open + seek + read of the isofs volume label from a block
+/// device. Never mounts, never writes; a read failure or short device
+/// simply yields None (the caller keeps probing).
+#[cfg(target_os = "linux")]
+pub fn read_isofs_volume_label(dev: &str) -> Result<Option<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(dev)
+        .with_context(|| format!("opening {dev} (read-only) for isofs label probe"))?;
+    if f.seek(SeekFrom::Start(ISOFS_PVD_OFFSET)).is_err() {
+        return Ok(None);
+    }
+    let mut buf = [0u8; ISOFS_BLOCK];
+    if f.read_exact(&mut buf).is_err() {
+        return Ok(None); // shorter than a PVD window — not a live medium
+    }
+    Ok(isofs_label_from_pvd(&buf))
+}
+#[cfg(not(target_os = "linux"))]
+pub fn read_isofs_volume_label(_dev: &str) -> Result<Option<String>> {
+    bail!("isofs label probe needs Linux block devices")
+}
+
+/// Devices whose /proc/mounts fstype is iso9660 — this catches the live
+/// medium even when its mount point is hidden under systemd's tmpfs /run
+/// (the mount record persists, the directory does not).
+pub fn find_iso9660_devices(mounts_raw: &str) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    mounts_raw
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() >= 3 && f[2] == "iso9660" {
+                Some(f[0].to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|d| seen.insert(d.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -263,7 +414,7 @@ mod tests {
         assert_eq!(lay.esp_start, 2048);
         assert_eq!(lay.esp_end, 2048 + 1_048_576 - 1); // 512 MiB
         assert_eq!(lay.root_start, 2048 + 1_048_576);
-        assert_eq!(lay.root_end, 41_943_040 - 33); // tail reserved
+        assert_eq!(lay.root_end, 41_943_040 - 34); // tail reserved (GPT backup block)
     }
 
     #[test]
@@ -284,11 +435,20 @@ mod tests {
         let lay = build_layout("/dev/sda", 41_943_040).unwrap();
         let cmds = all_partition_commands(&lay);
         assert_eq!(cmds[0], "sgdisk --zap-all /dev/sda");
+        // both partitions are created before any property is attached
         assert!(cmds[1].contains("--new=1:2048:1050623"));
-        assert!(cmds[1].contains("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"));
-        assert!(cmds[1].contains("--set-boot=1"));
-        assert!(cmds[2].contains("--new=2:1050624:41943007"));
-        assert!(cmds[2].contains("0FC63DAF-8483-4772-8E79-3D69D8477DE4"));
+        assert!(cmds[2].contains("--new=2:1050624:41943006")); // total-34
+        // each property is its own sgdisk invocation (the live image's
+        // sgdisk build does not commit --new and --type/--set-boot
+        // combined in one invocation)
+        assert!(cmds[3].contains("-t 1:C12A7328-F81F-11D2-BA4B-00A0C93EC93B"));
+        assert!(cmds[4].contains("-c 1:ESP"));
+        assert!(cmds[5].contains("-b 1"));
+        assert!(cmds[6].contains("-t 2:0FC63DAF-8483-4772-8E79-3D69D8477DE4"));
+        assert!(cmds[7].contains("-c 2:root"));
+        // creation commands carry no --type/--set-boot
+        assert!(!cmds[1].contains("--type"));
+        assert!(!cmds[2].contains("--set-boot"));
         // no partition command references a protective-MBR step
         assert!(!cmds.iter().any(|c| c.contains("protective")));
     }
@@ -361,9 +521,50 @@ mod tests {
     }
 
     #[test]
-    fn blockdev_parses_single_number() {
-        assert_eq!(total_sectors_from_blockdev("41943040\n"), 41_943_040);
-        assert_eq!(total_sectors_from_blockdev("   42\n"), 42);
-        assert_eq!(total_sectors_from_blockdev(""), 0);
+    fn sysfs_size_parses() {
+        assert_eq!(total_sectors_from_sysfs("41943040\n"), 41_943_040);
+        assert_eq!(total_sectors_from_sysfs("   42\n"), 42);
+        assert_eq!(total_sectors_from_sysfs(""), 0);
+    }
+
+    #[test]
+    fn isofs_label_parses() {
+        let mut pvd = [0u8; ISOFS_BLOCK];
+        pvd[0] = 1;
+        pvd[1..6].copy_from_slice(b"CD001");
+        // ISO9660 pads the volume ID with spaces, not NULs
+        pvd[40..72].fill(b' ');
+        let label = b"GOZJARO_LIVE";
+        pvd[40..40 + label.len()].copy_from_slice(label);
+        assert_eq!(
+            isofs_label_from_pvd(&pvd).as_deref(),
+            Some("GOZJARO_LIVE")
+        );
+        // bad magic
+        pvd[1..6].copy_from_slice(b"XXXXX");
+        assert_eq!(isofs_label_from_pvd(&pvd), None);
+        // empty label
+        pvd[1..6].copy_from_slice(b"CD001");
+        pvd[40..72].fill(b' ');
+        assert_eq!(isofs_label_from_pvd(&pvd), None);
+    }
+
+    #[test]
+    fn proc_mounts_finds_iso9660_devices() {
+        let mounts = "\
+/dev/sr0 /run/livecd iso9660 ro,relatime 0 0
+/dev/loop0 /run/squashfs squashfs ro,relatime 0 0
+/dev/sr0 /mnt/iso iso9660 ro,relatime 0 0
+/dev/sda2 / ext4 rw 0 0
+";
+        assert_eq!(find_iso9660_devices(mounts), vec!["/dev/sr0".to_string()]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sysfs_probes_are_harmless_on_missing_devices() {
+        assert!(!is_partition("/dev/definitely-missing-0"));
+        assert!(read_device_sectors("/dev/definitely-missing-0").is_err());
+        assert!(read_isofs_volume_label("/dev/definitely-missing-0").is_ok());
     }
 }

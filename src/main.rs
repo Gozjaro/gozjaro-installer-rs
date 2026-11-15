@@ -101,6 +101,12 @@ fn run() -> Result<()> {
             reboot,
             yes,
         } => {
+            if disks::is_partition(&disk) {
+                anyhow::bail!(
+                    "{disk} is a partition; --disk must be a whole disk \
+                     (e.g. /dev/sda), not one of its partitions"
+                );
+            }
             if !dry_run {
                 let uid = unsafe { libc::getuid() };
                 if uid != 0 {
@@ -114,22 +120,34 @@ fn run() -> Result<()> {
                 }
             }
             let mut inst = Installer::new(dry_run);
-            inst.check_env().context("environment check")?;
-            let _ = inst.list_disks(); // fill state.disks for the audit log
-            let total = inst
-                .disk_total_sectors(&disk)
-                .with_context(|| format!("cannot size {disk}"))?;
-            inst.state.disk = disk.clone();
-            inst.state.total_sectors = total;
-            inst.run_partitioning()
-                .with_context(|| format!("partitioning {disk}"))?;
-            inst.run_post_partition(&hostname, &tz, reboot)
-                .with_context(|| "post-partition steps")?;
-            if dry_run {
-                println!("dry-run audit trail:\n{}", inst.audit_trail());
-            }
+            // Run the whole pipeline; on failure we still want the full
+            // command log (including each tool's stderr) so the operator
+            // can see exactly what was tried before the bail.
+            let outcome = (|| -> anyhow::Result<()> {
+                inst.check_env().context("environment check")?;
+                let _ = inst.list_disks(); // fill state.disks for the audit log
+                let total = inst
+                    .disk_total_sectors(&disk)
+                    .with_context(|| format!("cannot size {disk}"))?;
+                inst.state.disk = disk.clone();
+                inst.state.total_sectors = total;
+                inst.run_partitioning()
+                    .with_context(|| format!("partitioning {disk}"))?;
+                inst.run_post_partition(&hostname, &tz, reboot)
+                    .with_context(|| "post-partition steps")?;
+                Ok(())
+            })();
             for line in &inst.log {
                 eprintln!("[{}] {}", line.kind, line.text);
+            }
+            if let Err(e) = outcome {
+                if dry_run {
+                    println!("dry-run audit trail:\n{}", inst.audit_trail());
+                }
+                return Err(e);
+            }
+            if dry_run {
+                println!("dry-run audit trail:\n{}", inst.audit_trail());
             }
         }
     }

@@ -81,11 +81,32 @@ impl Installer {
         let proc = cmd
             .output()
             .map_err(|e| anyhow!("cannot exec {}: {}", args[0], e))?;
-        let text = String::from_utf8_lossy(&proc.stdout).into_owned();
+        let out = String::from_utf8_lossy(&proc.stdout).into_owned();
+        let err = String::from_utf8_lossy(&proc.stderr).trim().to_string();
         let rc: i32 = proc.status.code().unwrap_or(-1);
         if check && rc != 0 {
-            let tail = text.lines().rev().take(12).collect::<Vec<_>>().join("\n");
+            let mut combined = out.clone();
+            if !err.is_empty() {
+                combined.push_str(&format!("\n{err}"));
+            }
+            let tail = combined.lines().rev().take(12).collect::<Vec<_>>().join("\n");
             bail!("{} failed (rc={rc}):\n{tail}", args[0]);
+        }
+        if rc == 0 && !err.is_empty() {
+            // a successful commit that the tool itself doubts is worth
+            // seeing (e.g. sgdisk "cannot commit" on a device that is not
+            // writable); only warn on words that signal trouble
+            if err.contains("fail")
+                || err.contains("error")
+                || err.contains("cannot")
+                || err.contains("refus")
+            {
+                self.logl("warn", format!("{}: {err}", args[0]));
+            }
+        }
+        let mut text = out;
+        if !err.is_empty() {
+            text.push_str(&format!("\n{err}"));
         }
         Ok((rc, text))
     }
@@ -116,8 +137,11 @@ impl Installer {
         }
         const BLKPG: libc::c_ulong = 0x1270;
         const BLKRRPART: libc::c_ulong = 0x1274;
-        let ok = if unsafe { libc::ioctl(fd, BLKPG) } < 0
-            && unsafe { libc::ioctl(fd, BLKRRPART) } < 0
+        // NB: recent libc types the ioctl request as `Ioctl` (u64 on gnu,
+        // narrower on some musl targets); the numeric constants above
+        // convert losslessly on all of them.
+        let ok = if unsafe { libc::ioctl(fd, BLKPG.try_into().unwrap()) } < 0
+            && unsafe { libc::ioctl(fd, BLKRRPART.try_into().unwrap()) } < 0
         {
             false
         } else {
@@ -130,6 +154,27 @@ impl Installer {
                 "warn",
                 format!("revalidate {dev}: kernel rejected BLKPG/BLKRRPART ({e}); device nodes may still appear on next access"),
             );
+        }
+        // Reinforce with the userland re-readers. Kernels with a stale
+        // partition cache (e.g. nodes left over from an earlier table on
+        // the same disk) can fail the raw BLKRRPART refresh; util-linux'
+        // partx -u (and partprobe, when the tree ships it) first unloads
+        // the cached partitions and then re-reads the table, which the
+        // kernel honors reliably. Best effort — the node poll in
+        // partition_and_format is the authority either way.
+        for tool in [
+            vec!["partx", "-u", dev],
+            vec!["partprobe", dev],
+        ] {
+            if which(&tool[0]).is_some() {
+                let (code, _) = self.exec_cmd(&tool, false)?;
+                if code == 0 {
+                    self.logl(
+                        "info",
+                        format!("revalidate {dev}: {} succeeded", tool[0]),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -156,45 +201,160 @@ impl Installer {
                 "UEFI firmware: no (BIOS path)".into()
             },
         );
-        // live source
-        let live_squash = Path::new("/run/squashfs");
-        if live_squash.is_dir() && Path::new("/run/livecd").is_dir() {
-            self.state.src = "/run/squashfs".into();
-            self.state.iso = "/run/livecd".into();
-            self.logl("info", "reusing live mounts (source=/run/squashfs)".into());
-            return Ok(());
+        // live source — discovery is read-only; only the real run mounts.
+        //
+        // 1) reuse visible live mounts. The initramfs provides
+        //    /live/{livecd,squashfs}; older images used /run/... which gets
+        //    hidden under systemd's tmpfs /run after boot (the directories
+        //    vanish, the mount records survive — see tier 2).
+        for (sq, iso) in [
+            ("/live/squashfs", "/live/livecd"),
+            ("/run/squashfs", "/run/livecd"),
+        ] {
+            if Path::new(sq).is_dir() && Path::new(iso).is_dir() {
+                self.state.src = sq.into();
+                self.state.iso = iso.into();
+                self.logl("info", format!("reusing live mounts (source={sq})"));
+                return Ok(());
+            }
         }
-        let (_, out) = self.exec_cmd(&["blkid", "-L", state::LIVE_LABEL], false)?;
-        let mut live = out.trim().to_string();
-        if live.is_empty() {
-            // fall back to probing cdrom/sd devices
-            for cand in ["/dev/sr0", "/dev/sr1", "/dev/sda"] {
-                if Path::new(cand).exists() {
-                    live = cand.to_string();
-                    break;
+        // 2) find the medium without mounting: iso9660 devices in
+        //    /proc/mounts (catches hidden /run mounts), then standard
+        //    cd/disk names; verify via a direct isofs volume-label read.
+        let medium = self.find_live_medium()?;
+        match medium {
+            Some(dev) => {
+                // Read-only materialization, in both modes: the planner
+                // needs the source tree (kernel listing, ISO copy) and a
+                // ro mount of the medium never writes to it. Real runs
+                // additionally keep the mount for later phases; dry-run
+                // unmounts it on exit like any other.
+                self.materialize_live_medium(&dev)
+            }
+            None => bail!(
+                "cannot find the live medium (isofs label {} on a mounted or \
+                 attached device)",
+                state::LIVE_LABEL
+            ),
+        }
+    }
+
+    /// Read-only medium discovery: /proc/mounts iso9660 devices first, then
+    /// standard probe names; each verified by its isofs volume label.
+    fn find_live_medium(&mut self) -> Result<Option<String>> {
+        let mut cands: Vec<String> = Vec::new();
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            cands.extend(disks::find_iso9660_devices(&mounts));
+        }
+        for name in ["/dev/sr0", "/dev/sr1", "/dev/sr2", "/dev/sr3", "/dev/sda", "/dev/sdb"] {
+            if Path::new(name).exists() {
+                cands.push(name.to_string());
+            }
+        }
+        for c in cands {
+            match disks::read_isofs_volume_label(&c) {
+                Ok(Some(label)) if label == state::LIVE_LABEL => {
+                    self.logl("info", format!("live medium: {c} (isofs label {label})"));
+                    return Ok(Some(c));
+                }
+                Ok(Some(label)) => {
+                    self.logl("info", format!("{c} is iso9660 but label is {label} (want {})", state::LIVE_LABEL));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.logl("warn", format!("label probe on {c} failed: {e:#}"));
                 }
             }
         }
-        if live.is_empty() {
-            bail!("cannot find the live medium (label {})", state::LIVE_LABEL);
+        Ok(None)
+    }
+
+    /// Run argv in BOTH modes (real and dry). Reserved for the read-only,
+    /// idempotent operations the planner itself needs even in dry-run:
+    /// medium materialization, stale-mount cleanup, and their teardown.
+    /// Every writing operation goes through `exec_cmd` (audit-only in
+    /// dry-run).
+    fn run_cmd(&mut self, argv: &[&str]) -> Result<(i32, String)> {
+        self.logl("cmd", format!("$ {} (direct)", argv.join(" ")));
+        let out = Command::new(argv[0])
+            .args(&argv[1..])
+            .output()
+            .with_context(|| format!("failed to run {}", argv[0]))?;
+        let code = out.status.code().unwrap_or(-1);
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.trim().is_empty() {
+            text.push_str(&format!("\n{err}"));
         }
+        Ok((code, text))
+    }
+
+    /// Real-run materialization: clear stale stacks from earlier failed runs,
+    /// mount the medium at /mnt/iso, verify the squashfs, loop-mount /mnt/src.
+    fn materialize_live_medium(&mut self, dev: &str) -> Result<()> {
+        self.clear_stale_mounts();
         std::fs::create_dir_all(state::ISO_MOUNT)
             .context(format!("cannot create {}", state::ISO_MOUNT))?;
-        self.exec_cmd(&["mount", "-o", "ro", &live, state::ISO_MOUNT], true)?;
+        let (code, err) = self.run_cmd(&["mount", "-o", "ro", dev, state::ISO_MOUNT])?;
+        if code != 0 {
+            bail!("mount {dev} failed (rc={code}): {err}");
+        }
         self.live_unmounts.push(state::ISO_MOUNT.to_string());
         let squash = format!("{}/live/filesystem.squashfs", state::ISO_MOUNT);
         if !Path::new(&squash).is_file() {
-            let _ = self.exec_cmd(&["umount", state::ISO_MOUNT], false);
-            bail!("{live} is not the Gozjaro live medium (no {squash})");
+            let _ = self.run_cmd(&["umount", state::ISO_MOUNT]);
+            self.live_unmounts.clear();
+            bail!("{dev} is not the Gozjaro live medium (no {squash})");
         }
         std::fs::create_dir_all(state::SRC_MOUNT)
             .context(format!("cannot create {}", state::SRC_MOUNT))?;
-        self.exec_cmd(&["mount", "-o", "ro,loop", &squash, state::SRC_MOUNT], true)?;
+        let (code, err) = self.run_cmd(&[
+            "mount",
+            "-o",
+            "ro,loop",
+            &squash,
+            state::SRC_MOUNT,
+        ])?;
+        if code != 0 {
+            bail!("mount {squash} failed (rc={code}): {err}");
+        }
         self.live_unmounts.push(state::SRC_MOUNT.to_string());
         self.state.src = state::SRC_MOUNT.into();
         self.state.iso = state::ISO_MOUNT.into();
-        self.logl("info", format!("live source loop-mounted at {}", state::SRC_MOUNT));
+        let (iso, src) = (state::ISO_MOUNT, state::SRC_MOUNT);
+        self.logl(
+            "info",
+            format!("live medium {dev}: {iso} (iso) + {src} (squashfs)"),
+        );
         Ok(())
+    }
+
+    /// Earlier failed runs each leave one more stacked /mnt/iso + /mnt/src
+    /// mount behind (a live-system check showed 5 stacked iso9660 mounts).
+    /// Unmount them before mounting fresh; best-effort, capped.
+    fn clear_stale_mounts(&mut self) {
+        for mp in [state::ISO_MOUNT, state::SRC_MOUNT] {
+            let n = Self::stale_mount_count(mp).min(10);
+            for _ in 0..n {
+                let Ok((code, _)) = self.run_cmd(&["umount", mp]) else {
+                    break;
+                };
+                if code != 0 {
+                    break;
+                }
+                self.logl("info", format!("cleared stale mount on {mp}"));
+            }
+        }
+    }
+
+    fn stale_mount_count(mp: &str) -> u32 {
+        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+            return 0;
+        };
+        mounts
+            .lines()
+            .filter(|l| l.split_whitespace().nth(1) == Some(mp))
+            .count() as u32
     }
 
     // ------------------------------------------------------------------
@@ -216,8 +376,9 @@ impl Installer {
     }
 
     pub fn disk_total_sectors(&mut self, dev: &str) -> Result<u64> {
-        let (_, out) = self.exec_cmd(&["blockdev", "--getsz", dev], true)?;
-        Ok(disks::total_sectors_from_blockdev(&out))
+        let total = disks::read_device_sectors(dev)?;
+        self.logl("info", format!("{dev}: {total} sectors (512 B)"));
+        Ok(total)
     }
 
     // ------------------------------------------------------------------
@@ -255,6 +416,16 @@ impl Installer {
                     bail!("partition {d} did not appear after revalidate");
                 }
             }
+        }
+
+        // Record the on-disk GPT/PTUUID so install_grub can pin the NVRAM
+        // entry to THIS disk (efibootmgr matches by name, so a second
+        // Gozjaro install would otherwise steal the "Gozjaro" entry).
+        if !self.dry_run {
+            let (_, pu) =
+                self.exec_cmd(&["blkid", "-s", "PTUUID", "-o", "value", dev], false)?;
+            self.state.gpt_uuid = pu.trim().to_string();
+            self.logl("info", format!("gpt uuid={}", self.state.gpt_uuid));
         }
 
         self.logl(
@@ -357,17 +528,24 @@ impl Installer {
     // ------------------------------------------------------------------
 
     pub fn install_kernel_and_config(&mut self, hostname: &str, tz: &str) -> Result<()> {
-        let moddir = format!("{}/lib/modules", state::ROOT_MOUNT);
+        // Kernel versions are enumerated from the tree that actually has
+        // them: the installed target in real mode, the (read-only mounted)
+        // live source in dry-run. The dry-run target is still empty, so
+        // reading it here is what used to bail with "no kernel under
+        // /mnt/install/lib/modules".
+        let moddir = if self.dry_run {
+            format!("{}/lib/modules", self.state.src)
+        } else {
+            format!("{}/lib/modules", state::ROOT_MOUNT)
+        };
         let mut kvers: Vec<String> = Vec::new();
-        if !self.dry_run {
-            if !Path::new(&moddir).is_dir() {
-                bail!("no {moddir} in the target (rsync incomplete?)");
-            }
-            for entry in std::fs::read_dir(&moddir)? {
-                let entry = entry?;
-                if entry.path().is_dir() {
-                    kvers.push(entry.file_name().to_string_lossy().into_owned());
-                }
+        if !Path::new(&moddir).is_dir() {
+            bail!("no {moddir} ({})", if self.dry_run { "source" } else { "target" });
+        }
+        for entry in std::fs::read_dir(&moddir)? {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                kvers.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
         let kver = plan::latest_kver(&kvers.iter().map(String::as_str).collect::<Vec<_>>())
@@ -447,12 +625,15 @@ impl Installer {
         let is_uefi = self.state.is_uefi;
         let root = state::ROOT_MOUNT;
         for sub in ["dev", "dev/pts", "proc", "sys", "run"] {
-            let (src, dst) = match sub {
-                "dev/pts" => ("/dev/pts", format!("{root}/dev/pts")),
-                other => (other, format!("{root}/{other}")),
+            // absolute source paths: `mount --bind dev ...` would look for
+            // ./dev relative to the installer's CWD and fail
+            let src: String = match sub {
+                "dev/pts" => "/dev/pts".into(),
+                other => format!("/{}", other),
             };
-            self.exec_cmd(&["mount", "--bind", src, &dst], true)?;
-            self.chroot_binds.push((src.to_string(), dst));
+            let dst = format!("{root}/{sub}");
+            self.exec_cmd(&["mount", "--bind", &src, &dst], true)?;
+            self.chroot_binds.push((src, dst));
         }
         // efibootmgr inside the chroot needs the live efivarfs visible
         if is_uefi {
@@ -484,7 +665,7 @@ impl Installer {
             &["chroot", state::ROOT_MOUNT, "/usr/sbin/gozjaro-build-initramfs", &s.kver],
             true,
         )?;
-        let out = format!("{}/{}/boot/{}", state::ROOT_MOUNT, s.kver, state::initrd_name(&s.kver));
+        let out = format!("{}/boot/{}", state::ROOT_MOUNT, state::initrd_name(&s.kver));
         if !self.dry_run && !Path::new(&out).is_file() {
             bail!("{out} was not produced by the chroot build");
         }
@@ -514,7 +695,12 @@ impl Installer {
                 &["chroot", state::ROOT_MOUNT, "efibootmgr", "-v"],
                 false,
             )?;
-            if let Some(entry) = plan::find_gozjaro_boot_entry(&out) {
+            let gpt_uuid = if s.gpt_uuid.is_empty() {
+                None
+            } else {
+                Some(s.gpt_uuid.as_str())
+            };
+            if let Some(entry) = plan::find_gozjaro_boot_entry(&out, gpt_uuid) {
                 let _ = self.exec_cmd(
                     &["chroot", state::ROOT_MOUNT, "efibootmgr", "-b", &entry],
                     false,
@@ -570,7 +756,14 @@ impl Installer {
         self.mounts.clear();
         let live: Vec<String> = self.live_unmounts.clone();
         for mnt in live.iter().rev() {
-            self.exec_cmd(&["umount", mnt], false)?;
+            if self.dry_run {
+                // medium materialization happened via real mounts in both
+                // modes; in dry-run exec_cmd only audits, so tear down the
+                // live mounts directly (best effort, already unmounted is OK)
+                let _ = self.run_cmd(&["umount", &mnt]);
+            } else {
+                self.exec_cmd(&["umount", &mnt], false)?;
+            }
         }
         self.live_unmounts.clear();
         self.exec_cmd(&["sync"], true)?;
@@ -652,8 +845,15 @@ mod tests {
         assert!(pos("mkfs.ext4") < pos("blkid"));
         // the sgdisk zap is the very first sgdisk invocation
         let sgdiks: Vec<_> = inst.audit.iter().filter(|c| c[0] == "sgdisk").collect();
-        assert_eq!(sgdiks.len(), 3);
+        // zap + 2 creates + 5 single-property calls (-t/-c/-b), one per
+        // invocation because the live image's sgdisk build does not
+        // commit combined --new+--type/--set-boot
+        assert_eq!(sgdiks.len(), 8);
         assert!(sgdiks[0][1].starts_with("--zap-all"));
+        assert!(sgdiks[1][1].starts_with("--new=1:"));
+        assert!(sgdiks[2][1].starts_with("--new=2:"));
+        assert_eq!(sgdiks[3][1], "-t");
+        assert!(sgdiks[3][2].starts_with("1:C12A7328"));
         let trail = inst.audit_trail();
         assert!(trail.contains("$ sgdisk --zap-all /dev/sda"));
     }
