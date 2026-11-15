@@ -27,7 +27,11 @@ pub const LINUX_GUID: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"; // Linux fi
 pub const SECTOR: u64 = 512;
 pub const ESP_START_SECTOR: u64 = 2048; // 1 MiB
 pub const ESP_SIZE_MIB: u64 = 512;
-pub const GPT_TAIL_RESERVE: u64 = 33; // backup GPT + protective MBR, sgdisk reserves it
+pub const GPT_TAIL_RESERVE: u64 = 34; // no partition may use the 33-sector
+                                       // backup-GPT block (entry array + header)
+                                       // at [total-33 .. total-1]; sgdisk
+                                       // rejects a partition ending inside it,
+                                       // so the last partition sector is total-34
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GptLayout {
@@ -62,9 +66,9 @@ pub fn root_start_sector(esp_mib: u64) -> u64 {
     esp_end_sector(esp_mib) + 1
 }
 
-/// Last usable sector for the root partition. sgdisk reserves 33 sectors at
-/// the tail for the backup GPT header + protective MBR; a partition must not
-/// run past total-33.
+/// Last usable sector for the root partition. The GPT reserves a 33-sector
+/// backup block at the tail; sgdisk rejects a partition whose last sector
+/// lands in that block, so a partition must end at or before total-34.
 pub fn root_end_sector(total_sectors: u64) -> Result<u64> {
     if total_sectors == 0 {
         bail!("total_sectors must be positive");
@@ -128,26 +132,44 @@ pub fn zap_commands(disk: &str) -> Vec<String> {
 }
 
 /// Create p1 (ESP) and p2 (root). sgdisk `--new=no:start:end` is inclusive
-/// on both ends; the GUIDs are spelled explicitly so the command is
+/// on both ends; the GUIDs are spelled explicitly so the commands are
 /// self-documenting and independent of sgdisk's keyword table.
+///
+/// Every property is applied in its OWN sgdisk invocation: the sgdisk in
+/// the GozJaro image does not commit when `--new` and `--type`/`--set-boot`
+/// ride on the same invocation (it exits 0 and writes nothing), whereas
+/// plain `--new` and the single-property `-t`/`-c`/`-b` forms each commit
+/// reliably. Verified against the live image's sgdisk build.
 pub fn partition_commands(l: &GptLayout) -> Vec<String> {
+    let d = l.disk.as_str();
     vec![
+        // create both partitions first
         format!(
-            "sgdisk --new={no}:{start}:{end} --type={no}:{guid} --change-name={no}:ESP --set-boot={no} {disk}",
+            "sgdisk --new={no}:{start}:{end} {d}",
             no = l.esp_no,
             start = l.esp_start,
-            end = l.esp_end,
-            guid = l.esp_guid,
-            disk = l.disk
+            end = l.esp_end
         ),
         format!(
-            "sgdisk --new={no}:{start}:{end} --type={no}:{guid} --change-name={no}:root {disk}",
+            "sgdisk --new={no}:{start}:{end} {d}",
             no = l.root_no,
             start = l.root_start,
-            end = l.root_end,
-            guid = l.root_guid,
-            disk = l.disk
+            end = l.root_end
         ),
+        // then attach the properties, one invocation each
+        format!(
+            "sgdisk -t {no}:{guid} {d}",
+            no = l.esp_no,
+            guid = l.esp_guid
+        ),
+        format!("sgdisk -c {no}:ESP {d}", no = l.esp_no),
+        format!("sgdisk -b {no} {d}", no = l.esp_no), // legacy BIOS bootable
+        format!(
+            "sgdisk -t {no}:{guid} {d}",
+            no = l.root_no,
+            guid = l.root_guid
+        ),
+        format!("sgdisk -c {no}:root {d}", no = l.root_no),
     ]
 }
 
@@ -392,7 +414,7 @@ mod tests {
         assert_eq!(lay.esp_start, 2048);
         assert_eq!(lay.esp_end, 2048 + 1_048_576 - 1); // 512 MiB
         assert_eq!(lay.root_start, 2048 + 1_048_576);
-        assert_eq!(lay.root_end, 41_943_040 - 33); // tail reserved
+        assert_eq!(lay.root_end, 41_943_040 - 34); // tail reserved (GPT backup block)
     }
 
     #[test]
@@ -413,11 +435,20 @@ mod tests {
         let lay = build_layout("/dev/sda", 41_943_040).unwrap();
         let cmds = all_partition_commands(&lay);
         assert_eq!(cmds[0], "sgdisk --zap-all /dev/sda");
+        // both partitions are created before any property is attached
         assert!(cmds[1].contains("--new=1:2048:1050623"));
-        assert!(cmds[1].contains("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"));
-        assert!(cmds[1].contains("--set-boot=1"));
-        assert!(cmds[2].contains("--new=2:1050624:41943007"));
-        assert!(cmds[2].contains("0FC63DAF-8483-4772-8E79-3D69D8477DE4"));
+        assert!(cmds[2].contains("--new=2:1050624:41943006")); // total-34
+        // each property is its own sgdisk invocation (the live image's
+        // sgdisk build does not commit --new and --type/--set-boot
+        // combined in one invocation)
+        assert!(cmds[3].contains("-t 1:C12A7328-F81F-11D2-BA4B-00A0C93EC93B"));
+        assert!(cmds[4].contains("-c 1:ESP"));
+        assert!(cmds[5].contains("-b 1"));
+        assert!(cmds[6].contains("-t 2:0FC63DAF-8483-4772-8E79-3D69D8477DE4"));
+        assert!(cmds[7].contains("-c 2:root"));
+        // creation commands carry no --type/--set-boot
+        assert!(!cmds[1].contains("--type"));
+        assert!(!cmds[2].contains("--set-boot"));
         // no partition command references a protective-MBR step
         assert!(!cmds.iter().any(|c| c.contains("protective")));
     }

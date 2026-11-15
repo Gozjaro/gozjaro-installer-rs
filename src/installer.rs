@@ -81,11 +81,32 @@ impl Installer {
         let proc = cmd
             .output()
             .map_err(|e| anyhow!("cannot exec {}: {}", args[0], e))?;
-        let text = String::from_utf8_lossy(&proc.stdout).into_owned();
+        let out = String::from_utf8_lossy(&proc.stdout).into_owned();
+        let err = String::from_utf8_lossy(&proc.stderr).trim().to_string();
         let rc: i32 = proc.status.code().unwrap_or(-1);
         if check && rc != 0 {
-            let tail = text.lines().rev().take(12).collect::<Vec<_>>().join("\n");
+            let mut combined = out.clone();
+            if !err.is_empty() {
+                combined.push_str(&format!("\n{err}"));
+            }
+            let tail = combined.lines().rev().take(12).collect::<Vec<_>>().join("\n");
             bail!("{} failed (rc={rc}):\n{tail}", args[0]);
+        }
+        if rc == 0 && !err.is_empty() {
+            // a successful commit that the tool itself doubts is worth
+            // seeing (e.g. sgdisk "cannot commit" on a device that is not
+            // writable); only warn on words that signal trouble
+            if err.contains("fail")
+                || err.contains("error")
+                || err.contains("cannot")
+                || err.contains("refus")
+            {
+                self.logl("warn", format!("{}: {err}", args[0]));
+            }
+        }
+        let mut text = out;
+        if !err.is_empty() {
+            text.push_str(&format!("\n{err}"));
         }
         Ok((rc, text))
     }
@@ -631,7 +652,7 @@ impl Installer {
             &["chroot", state::ROOT_MOUNT, "/usr/sbin/gozjaro-build-initramfs", &s.kver],
             true,
         )?;
-        let out = format!("{}/{}/boot/{}", state::ROOT_MOUNT, s.kver, state::initrd_name(&s.kver));
+        let out = format!("{}/boot/{}", state::ROOT_MOUNT, state::initrd_name(&s.kver));
         if !self.dry_run && !Path::new(&out).is_file() {
             bail!("{out} was not produced by the chroot build");
         }
@@ -806,8 +827,15 @@ mod tests {
         assert!(pos("mkfs.ext4") < pos("blkid"));
         // the sgdisk zap is the very first sgdisk invocation
         let sgdiks: Vec<_> = inst.audit.iter().filter(|c| c[0] == "sgdisk").collect();
-        assert_eq!(sgdiks.len(), 3);
+        // zap + 2 creates + 5 single-property calls (-t/-c/-b), one per
+        // invocation because the live image's sgdisk build does not
+        // commit combined --new+--type/--set-boot
+        assert_eq!(sgdiks.len(), 8);
         assert!(sgdiks[0][1].starts_with("--zap-all"));
+        assert!(sgdiks[1][1].starts_with("--new=1:"));
+        assert!(sgdiks[2][1].starts_with("--new=2:"));
+        assert_eq!(sgdiks[3][1], "-t");
+        assert!(sgdiks[3][2].starts_with("1:C12A7328"));
         let trail = inst.audit_trail();
         assert!(trail.contains("$ sgdisk --zap-all /dev/sda"));
     }
