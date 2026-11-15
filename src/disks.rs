@@ -15,6 +15,8 @@
 //! scriptable, and is what LFS ships.
 
 use anyhow::{anyhow, bail, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -244,10 +246,114 @@ pub fn parse_lsblk_block_devices(raw: &str) -> Vec<DiskInfo> {
         .collect()
 }
 
-/// `blockdev --getsz DEV` prints a single sector count (512-byte units).
-pub fn total_sectors_from_blockdev(raw: &str) -> u64 {
-    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
-    digits.parse().unwrap_or(0)
+/// Parse `/sys/block/<dev>/size` (device size in 512-byte sectors).
+pub fn total_sectors_from_sysfs(raw: &str) -> u64 {
+    raw.trim().parse().unwrap_or(0)
+}
+
+/// `/sys/block` directory for a device node (`/dev/sdX`, `/dev/sdXN`,
+/// `/dev/srN`, `/dev/loopN`, `/dev/nvmeXnYpZ` all live there).
+pub fn sysfs_block_path(dev: &str) -> std::path::PathBuf {
+    let name = std::path::Path::new(dev)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dev.to_string());
+    std::path::Path::new("/sys/block").join(name)
+}
+
+/// True when `dev` is a partition, not a whole disk: partition sysfs
+/// entries carry a `range` attribute (first-sector:last-sector), whole
+/// disks do not. Returns false when the device has no sysfs entry.
+pub fn is_partition(dev: &str) -> bool {
+    sysfs_block_path(dev).join("range").is_file()
+}
+
+/// Device size in 512-byte sectors, read straight from sysfs — no shell
+/// (the dry-run audit mode makes `exec_cmd` return empty output, which
+/// used to zero the sector count and kill GPT planning).
+#[cfg(target_os = "linux")]
+pub fn read_device_sectors(dev: &str) -> Result<u64> {
+    let p = sysfs_block_path(dev).join("size");
+    let raw = std::fs::read_to_string(p.as_os_str())
+        .with_context(|| format!("reading {}", p.display()))?;
+    let n = total_sectors_from_sysfs(&raw);
+    if n == 0 {
+        bail!("{dev}: sysfs sector size is 0 (device missing or unreadable)");
+    }
+    Ok(n)
+}
+#[cfg(not(target_os = "linux"))]
+pub fn read_device_sectors(_dev: &str) -> Result<u64> {
+    bail!("read_device_sectors needs Linux sysfs")
+}
+
+// --- isofs (ISO 9660) read-only medium verification ------------------------
+//
+// The live medium is verified WITHOUT mounting: the Primary Volume
+// Descriptor sits at logical sector 16 (absolute offset 32 KiB), 2048
+// bytes: type 0x01, magic "CD001", volume label at bytes 40..72.
+
+pub const ISOFS_PVD_OFFSET: u64 = 32_768;
+pub const ISOFS_BLOCK: usize = 2048;
+
+/// Volume label from raw PVD bytes; None on bad magic or empty label.
+pub fn isofs_label_from_pvd(pvd: &[u8]) -> Option<String> {
+    if pvd.len() < ISOFS_BLOCK || pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        return None;
+    }
+    let label = pvd[40..72]
+        .iter()
+        .map(|b| *b as char)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+/// Read-only open + seek + read of the isofs volume label from a block
+/// device. Never mounts, never writes; a read failure or short device
+/// simply yields None (the caller keeps probing).
+#[cfg(target_os = "linux")]
+pub fn read_isofs_volume_label(dev: &str) -> Result<Option<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(dev)
+        .with_context(|| format!("opening {dev} (read-only) for isofs label probe"))?;
+    if f.seek(SeekFrom::Start(ISOFS_PVD_OFFSET)).is_err() {
+        return Ok(None);
+    }
+    let mut buf = [0u8; ISOFS_BLOCK];
+    if f.read_exact(&mut buf).is_err() {
+        return Ok(None); // shorter than a PVD window — not a live medium
+    }
+    Ok(isofs_label_from_pvd(&buf))
+}
+#[cfg(not(target_os = "linux"))]
+pub fn read_isofs_volume_label(_dev: &str) -> Result<Option<String>> {
+    bail!("isofs label probe needs Linux block devices")
+}
+
+/// Devices whose /proc/mounts fstype is iso9660 — this catches the live
+/// medium even when its mount point is hidden under systemd's tmpfs /run
+/// (the mount record persists, the directory does not).
+pub fn find_iso9660_devices(mounts_raw: &str) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    mounts_raw
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() >= 3 && f[2] == "iso9660" {
+                Some(f[0].to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|d| seen.insert(d.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -361,9 +467,50 @@ mod tests {
     }
 
     #[test]
-    fn blockdev_parses_single_number() {
-        assert_eq!(total_sectors_from_blockdev("41943040\n"), 41_943_040);
-        assert_eq!(total_sectors_from_blockdev("   42\n"), 42);
-        assert_eq!(total_sectors_from_blockdev(""), 0);
+    fn sysfs_size_parses() {
+        assert_eq!(total_sectors_from_sysfs("41943040\n"), 41_943_040);
+        assert_eq!(total_sectors_from_sysfs("   42\n"), 42);
+        assert_eq!(total_sectors_from_sysfs(""), 0);
+    }
+
+    #[test]
+    fn isofs_label_parses() {
+        let mut pvd = [0u8; ISOFS_BLOCK];
+        pvd[0] = 1;
+        pvd[1..6].copy_from_slice(b"CD001");
+        // ISO9660 pads the volume ID with spaces, not NULs
+        pvd[40..72].fill(b' ');
+        let label = b"GOZJARO_LIVE";
+        pvd[40..40 + label.len()].copy_from_slice(label);
+        assert_eq!(
+            isofs_label_from_pvd(&pvd).as_deref(),
+            Some("GOZJARO_LIVE")
+        );
+        // bad magic
+        pvd[1..6].copy_from_slice(b"XXXXX");
+        assert_eq!(isofs_label_from_pvd(&pvd), None);
+        // empty label
+        pvd[1..6].copy_from_slice(b"CD001");
+        pvd[40..72].fill(b' ');
+        assert_eq!(isofs_label_from_pvd(&pvd), None);
+    }
+
+    #[test]
+    fn proc_mounts_finds_iso9660_devices() {
+        let mounts = "\
+/dev/sr0 /run/livecd iso9660 ro,relatime 0 0
+/dev/loop0 /run/squashfs squashfs ro,relatime 0 0
+/dev/sr0 /mnt/iso iso9660 ro,relatime 0 0
+/dev/sda2 / ext4 rw 0 0
+";
+        assert_eq!(find_iso9660_devices(mounts), vec!["/dev/sr0".to_string()]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sysfs_probes_are_harmless_on_missing_devices() {
+        assert!(!is_partition("/dev/definitely-missing-0"));
+        assert!(read_device_sectors("/dev/definitely-missing-0").is_err());
+        assert!(read_isofs_volume_label("/dev/definitely-missing-0").is_ok());
     }
 }

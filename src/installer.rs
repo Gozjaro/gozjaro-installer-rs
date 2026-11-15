@@ -156,36 +156,98 @@ impl Installer {
                 "UEFI firmware: no (BIOS path)".into()
             },
         );
-        // live source
-        let live_squash = Path::new("/run/squashfs");
-        if live_squash.is_dir() && Path::new("/run/livecd").is_dir() {
-            self.state.src = "/run/squashfs".into();
-            self.state.iso = "/run/livecd".into();
-            self.logl("info", "reusing live mounts (source=/run/squashfs)".into());
-            return Ok(());
+        // live source — discovery is read-only; only the real run mounts.
+        //
+        // 1) reuse visible live mounts. The initramfs provides
+        //    /live/{livecd,squashfs}; older images used /run/... which gets
+        //    hidden under systemd's tmpfs /run after boot (the directories
+        //    vanish, the mount records survive — see tier 2).
+        for (sq, iso) in [
+            ("/live/squashfs", "/live/livecd"),
+            ("/run/squashfs", "/run/livecd"),
+        ] {
+            if Path::new(sq).is_dir() && Path::new(iso).is_dir() {
+                self.state.src = sq.into();
+                self.state.iso = iso.into();
+                self.logl("info", format!("reusing live mounts (source={sq})"));
+                return Ok(());
+            }
         }
-        let (_, out) = self.exec_cmd(&["blkid", "-L", state::LIVE_LABEL], false)?;
-        let mut live = out.trim().to_string();
-        if live.is_empty() {
-            // fall back to probing cdrom/sd devices
-            for cand in ["/dev/sr0", "/dev/sr1", "/dev/sda"] {
-                if Path::new(cand).exists() {
-                    live = cand.to_string();
-                    break;
+        // 2) find the medium without mounting: iso9660 devices in
+        //    /proc/mounts (catches hidden /run mounts), then standard
+        //    cd/disk names; verify via a direct isofs volume-label read.
+        let medium = self.find_live_medium()?;
+        match medium {
+            Some(dev) => {
+                if self.dry_run {
+                    // no real mounts in dry-run: the planner just needs the
+                    // verified medium + its expected materialized paths
+                    self.state.iso = state::ISO_MOUNT.into();
+                    self.state.src = state::SRC_MOUNT.into();
+                    let (iso, src) = (state::ISO_MOUNT, state::SRC_MOUNT);
+                    self.logl(
+                        "info",
+                        format!(
+                            "{dev} verified read-only (isofs label {}); dry-run keeps \
+                             {iso} + {src} audit-only",
+                            state::LIVE_LABEL
+                        ),
+                    );
+                    Ok(())
+                } else {
+                    self.materialize_live_medium(&dev)
+                }
+            }
+            None => bail!(
+                "cannot find the live medium (isofs label {} on a mounted or \
+                 attached device)",
+                state::LIVE_LABEL
+            ),
+        }
+    }
+
+    /// Read-only medium discovery: /proc/mounts iso9660 devices first, then
+    /// standard probe names; each verified by its isofs volume label.
+    fn find_live_medium(&mut self) -> Result<Option<String>> {
+        let mut cands: Vec<String> = Vec::new();
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            cands.extend(disks::find_iso9660_devices(&mounts));
+        }
+        for name in ["/dev/sr0", "/dev/sr1", "/dev/sr2", "/dev/sr3", "/dev/sda", "/dev/sdb"] {
+            if Path::new(name).exists() {
+                cands.push(name.to_string());
+            }
+        }
+        for c in cands {
+            match disks::read_isofs_volume_label(&c) {
+                Ok(Some(label)) if label == state::LIVE_LABEL => {
+                    self.logl("info", format!("live medium: {c} (isofs label {label})"));
+                    return Ok(Some(c));
+                }
+                Ok(Some(label)) => {
+                    self.logl("info", format!("{c} is iso9660 but label is {label} (want {})", state::LIVE_LABEL));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.logl("warn", format!("label probe on {c} failed: {e:#}"));
                 }
             }
         }
-        if live.is_empty() {
-            bail!("cannot find the live medium (label {})", state::LIVE_LABEL);
-        }
+        Ok(None)
+    }
+
+    /// Real-run materialization: clear stale stacks from earlier failed runs,
+    /// mount the medium at /mnt/iso, verify the squashfs, loop-mount /mnt/src.
+    fn materialize_live_medium(&mut self, dev: &str) -> Result<()> {
+        self.clear_stale_mounts();
         std::fs::create_dir_all(state::ISO_MOUNT)
             .context(format!("cannot create {}", state::ISO_MOUNT))?;
-        self.exec_cmd(&["mount", "-o", "ro", &live, state::ISO_MOUNT], true)?;
+        self.exec_cmd(&["mount", "-o", "ro", dev, state::ISO_MOUNT], true)?;
         self.live_unmounts.push(state::ISO_MOUNT.to_string());
         let squash = format!("{}/live/filesystem.squashfs", state::ISO_MOUNT);
         if !Path::new(&squash).is_file() {
             let _ = self.exec_cmd(&["umount", state::ISO_MOUNT], false);
-            bail!("{live} is not the Gozjaro live medium (no {squash})");
+            bail!("{dev} is not the Gozjaro live medium (no {squash})");
         }
         std::fs::create_dir_all(state::SRC_MOUNT)
             .context(format!("cannot create {}", state::SRC_MOUNT))?;
@@ -193,8 +255,40 @@ impl Installer {
         self.live_unmounts.push(state::SRC_MOUNT.to_string());
         self.state.src = state::SRC_MOUNT.into();
         self.state.iso = state::ISO_MOUNT.into();
-        self.logl("info", format!("live source loop-mounted at {}", state::SRC_MOUNT));
+        let (iso, src) = (state::ISO_MOUNT, state::SRC_MOUNT);
+        self.logl(
+            "info",
+            format!("live medium {dev}: {iso} (iso) + {src} (squashfs)"),
+        );
         Ok(())
+    }
+
+    /// Earlier failed runs each leave one more stacked /mnt/iso + /mnt/src
+    /// mount behind (a live-system check showed 5 stacked iso9660 mounts).
+    /// Unmount them before mounting fresh; best-effort, capped.
+    fn clear_stale_mounts(&mut self) {
+        for mp in [state::ISO_MOUNT, state::SRC_MOUNT] {
+            let n = Self::stale_mount_count(mp).min(10);
+            for _ in 0..n {
+                let Ok((code, _)) = self.exec_cmd(&["umount", mp], false) else {
+                    break;
+                };
+                if code != 0 {
+                    break;
+                }
+                self.logl("info", format!("cleared stale mount on {mp}"));
+            }
+        }
+    }
+
+    fn stale_mount_count(mp: &str) -> u32 {
+        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+            return 0;
+        };
+        mounts
+            .lines()
+            .filter(|l| l.split_whitespace().nth(1) == Some(mp))
+            .count() as u32
     }
 
     // ------------------------------------------------------------------
@@ -216,8 +310,9 @@ impl Installer {
     }
 
     pub fn disk_total_sectors(&mut self, dev: &str) -> Result<u64> {
-        let (_, out) = self.exec_cmd(&["blockdev", "--getsz", dev], true)?;
-        Ok(disks::total_sectors_from_blockdev(&out))
+        let total = disks::read_device_sectors(dev)?;
+        self.logl("info", format!("{dev}: {total} sectors (512 B)"));
+        Ok(total)
     }
 
     // ------------------------------------------------------------------

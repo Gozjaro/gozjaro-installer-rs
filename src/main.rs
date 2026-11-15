@@ -101,6 +101,12 @@ fn run() -> Result<()> {
             reboot,
             yes,
         } => {
+            if disks::is_partition(&disk) {
+                anyhow::bail!(
+                    "{disk} is a partition; --disk must be a whole disk \
+                     (e.g. /dev/sda), not one of its partitions"
+                );
+            }
             if !dry_run {
                 let uid = unsafe { libc::getuid() };
                 if uid != 0 {
