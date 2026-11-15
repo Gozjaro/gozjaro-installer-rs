@@ -134,6 +134,27 @@ impl Installer {
                 format!("revalidate {dev}: kernel rejected BLKPG/BLKRRPART ({e}); device nodes may still appear on next access"),
             );
         }
+        // Reinforce with the userland re-readers. Kernels with a stale
+        // partition cache (e.g. nodes left over from an earlier table on
+        // the same disk) can fail the raw BLKRRPART refresh; util-linux'
+        // partx -u (and partprobe, when the tree ships it) first unloads
+        // the cached partitions and then re-reads the table, which the
+        // kernel honors reliably. Best effort — the node poll in
+        // partition_and_format is the authority either way.
+        for tool in [
+            vec!["partx", "-u", dev],
+            vec!["partprobe", dev],
+        ] {
+            if which(&tool[0]).is_some() {
+                let (code, _) = self.exec_cmd(&tool, false)?;
+                if code == 0 {
+                    self.logl(
+                        "info",
+                        format!("revalidate {dev}: {} succeeded", tool[0]),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
