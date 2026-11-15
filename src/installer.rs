@@ -615,12 +615,15 @@ impl Installer {
         let is_uefi = self.state.is_uefi;
         let root = state::ROOT_MOUNT;
         for sub in ["dev", "dev/pts", "proc", "sys", "run"] {
-            let (src, dst) = match sub {
-                "dev/pts" => ("/dev/pts", format!("{root}/dev/pts")),
-                other => (other, format!("{root}/{other}")),
+            // absolute source paths: `mount --bind dev ...` would look for
+            // ./dev relative to the installer's CWD and fail
+            let src: String = match sub {
+                "dev/pts" => "/dev/pts".into(),
+                other => format!("/{}", other),
             };
-            self.exec_cmd(&["mount", "--bind", src, &dst], true)?;
-            self.chroot_binds.push((src.to_string(), dst));
+            let dst = format!("{root}/{sub}");
+            self.exec_cmd(&["mount", "--bind", &src, &dst], true)?;
+            self.chroot_binds.push((src, dst));
         }
         // efibootmgr inside the chroot needs the live efivarfs visible
         if is_uefi {
