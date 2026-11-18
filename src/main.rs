@@ -56,6 +56,23 @@ enum Cmd {
     },
 }
 
+/// The GozJaro ASCII dog. Shown on the interactive `run` path only, so
+/// `disks` / `plan` stay machine-readable (pipeable) without a banner.
+const BANNER: &str = r" /\              /\
+/##\            /%%\
+|###\          /%%%|
+|####\________/%%%%|
+|        <>        |
+|                  |
+|   \_\      /_/   |
+ \                /
+  \              /
+   \            /
+    \    <>    /
+     \        /
+      \______/"
+    ;
+
 fn main() -> ExitCode {
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
@@ -101,6 +118,8 @@ fn run() -> Result<()> {
             reboot,
             yes,
         } => {
+            // Branding: the GozJaro dog on the interactive install path
+            print!("{BANNER}\n\n");
             if disks::is_partition(&disk) {
                 anyhow::bail!(
                     "{disk} is a partition; --disk must be a whole disk \
