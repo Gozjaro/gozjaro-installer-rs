@@ -365,8 +365,14 @@ pub fn isofs_label_from_pvd(pvd: &[u8]) -> Option<String> {
 #[cfg(target_os = "linux")]
 pub fn read_isofs_volume_label(dev: &str) -> Result<Option<String>> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(dev)
-        .with_context(|| format!("opening {dev} (read-only) for isofs label probe"))?;
+    let f = match std::fs::File::open(dev) {
+        Ok(f) => f,
+        // Probe contract (see the doc comment): an unopenable or missing
+        // device simply has no readable label — the caller keeps probing,
+        // it is not an error.
+        Err(_) => return Ok(None),
+    };
+    let mut f = f;
     if f.seek(SeekFrom::Start(ISOFS_PVD_OFFSET)).is_err() {
         return Ok(None);
     }
