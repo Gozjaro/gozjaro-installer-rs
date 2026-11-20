@@ -2,12 +2,14 @@
 //! `lib/disks.py` — nothing here touches a running system: it builds
 //! sgdisk *command strings* and filesystem specs that the executor runs.
 //!
-//! Partition plan (GPT, x86_64 UEFI; also valid for a legacy-BIOS boot via
-//! the protected-MBR + LegacyBIOSBootable attribute on p1):
+//! Partition plan (GPT, x86_64 UEFI; legacy-BIOS boot via a BIOS Boot
+//! partition — grub-install(i386-pc) refuses blocklists, and GPT leaves no
+//! embedding gap, so BIOS boot needs an unformatted 2 MiB bios_grub part):
 //!
 //! ```text
-//! p1  ESP   1 MiB .. 513 MiB   FAT32   GUID C12A7328-... (EFI)   LegacyBIOSBootable
-//! p2  root  513 MiB .. end     ext4    GUID 0FC63DAF-... (Linux)
+//! p1  biosboot  1 MiB .. 3 MiB     (raw)     GUID 21686148-... (BIOS Boot)
+//! p2  ESP       3 MiB .. 515 MiB    FAT32    GUID C12A7328-... (EFI)   LegacyBIOSBootable
+//! p3  root      515 MiB .. end      ext4     GUID 0FC63DAF-... (Linux)
 //! ```
 //!
 //! Why sgdisk and not parted: the live image's parted 3.6 segfaults in its
@@ -23,9 +25,13 @@ use serde::Serialize;
 /// GPT partition type GUIDs (upper-case, canonical).
 pub const ESP_GUID: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"; // EFI System
 pub const LINUX_GUID: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"; // Linux filesystem
+pub const BBP_GUID: &str = "21686148-6449-4447-8652-9D952C626A1C";  // BIOS Boot
 
 pub const SECTOR: u64 = 512;
-pub const ESP_START_SECTOR: u64 = 2048; // 1 MiB
+pub const BBP_START_SECTOR: u64 = 2048; // 1 MiB
+pub const BBP_SIZE_MIB: u64 = 2;        // 2 MiB — the i386-pc embedding area
+pub const ESP_START_SECTOR: u64 =
+    BBP_START_SECTOR + BBP_SIZE_MIB * 1024 * 1024 / SECTOR; // 3 MiB
 pub const ESP_SIZE_MIB: u64 = 512;
 pub const GPT_TAIL_RESERVE: u64 = 34; // no partition may use the 33-sector
                                        // backup-GPT block (entry array + header)
@@ -36,12 +42,16 @@ pub const GPT_TAIL_RESERVE: u64 = 34; // no partition may use the 33-sector
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GptLayout {
     pub disk: String,
+    pub bbp_no: u32,
     pub esp_no: u32,
     pub root_no: u32,
+    pub bbp_start: u64,
+    pub bbp_end: u64,
     pub esp_start: u64,
     pub esp_end: u64,
     pub root_start: u64,
     pub root_end: u64,
+    pub bbp_guid: &'static str,
     pub esp_guid: &'static str,
     pub root_guid: &'static str,
 }
@@ -57,7 +67,12 @@ pub struct DiskInfo {
 // Geometry
 // ---------------------------------------------------------------------------
 
-/// Inclusive end sector of the ESP given 512-byte sectors.
+/// Inclusive end sector of the BIOS Boot partition (always the first one).
+pub fn bbp_end_sector() -> u64 {
+    BBP_START_SECTOR + BBP_SIZE_MIB * 1024 * 1024 / SECTOR - 1
+}
+
+/// Inclusive end sector of the ESP given its size in MiB.
 pub fn esp_end_sector(esp_mib: u64) -> u64 {
     ESP_START_SECTOR + esp_mib * 1024 * 1024 / SECTOR - 1
 }
@@ -85,17 +100,24 @@ pub fn root_end_sector(total_sectors: u64) -> Result<u64> {
 pub fn build_layout(disk: &str, total_sectors: u64) -> Result<GptLayout> {
     let layout = GptLayout {
         disk: disk.to_string(),
-        esp_no: 1,
-        root_no: 2,
+        bbp_no: 1,
+        esp_no: 2,
+        root_no: 3,
+        bbp_start: BBP_START_SECTOR,
+        bbp_end: bbp_end_sector(),
         esp_start: ESP_START_SECTOR,
         esp_end: esp_end_sector(ESP_SIZE_MIB),
         root_start: root_start_sector(ESP_SIZE_MIB),
         root_end: root_end_sector(total_sectors)?,
+        bbp_guid: BBP_GUID,
         esp_guid: ESP_GUID,
         root_guid: LINUX_GUID,
     };
-    // Hard invariant: the ESP must sit entirely inside the disk and the root
+    // Hard invariants: every partition must sit inside the disk and the root
     // must have at least one sector.
+    if layout.bbp_end >= total_sectors {
+        bail!("disk too small: {total_sectors} sectors cannot hold the {} MiB BIOS Boot partition (ends at sector {})", BBP_SIZE_MIB, layout.bbp_end);
+    }
     if layout.esp_end >= total_sectors {
         bail!(
             "disk too small: {total_sectors} sectors cannot hold the \
@@ -143,7 +165,13 @@ pub fn zap_commands(disk: &str) -> Vec<String> {
 pub fn partition_commands(l: &GptLayout) -> Vec<String> {
     let d = l.disk.as_str();
     vec![
-        // create both partitions first
+        // create all three partitions first
+        format!(
+            "sgdisk --new={no}:{start}:{end} {d}",
+            no = l.bbp_no,
+            start = l.bbp_start,
+            end = l.bbp_end
+        ),
         format!(
             "sgdisk --new={no}:{start}:{end} {d}",
             no = l.esp_no,
@@ -157,6 +185,13 @@ pub fn partition_commands(l: &GptLayout) -> Vec<String> {
             end = l.root_end
         ),
         // then attach the properties, one invocation each
+        format!(
+            "sgdisk -t {no}:{guid} {d}",
+            no = l.bbp_no,
+            guid = l.bbp_guid
+        ),
+        // no space in the name: sgdisk -c takes one shell word
+        format!("sgdisk -c {no}:BIOSBoot {d}", no = l.bbp_no),
         format!(
             "sgdisk -t {no}:{guid} {d}",
             no = l.esp_no,
@@ -173,7 +208,8 @@ pub fn partition_commands(l: &GptLayout) -> Vec<String> {
     ]
 }
 
-/// FAT32 ESP + ext4 root with the given volume labels.
+/// FAT32 ESP + ext4 root with the given volume labels; the BIOS Boot
+/// partition is left unformatted on purpose (grub's i386-pc embedding area).
 /// ESP device node: nvme/mmcblk use p-suffixed minors, sd* don't.
 pub fn format_specs(l: &GptLayout, esp_label: &str, root_label: &str) -> Vec<String> {
     let (esp_dev, root_dev) = partition_device_names(&l.disk, l.esp_no, l.root_no);
@@ -417,9 +453,11 @@ mod tests {
     fn known_21gb_disk_matches_sfdisk_dump() {
         // 21.5 GiB VMware disk, 512-byte sectors, total = 41943040 sectors.
         let lay = build_layout("/dev/sda", 41_943_040).unwrap();
-        assert_eq!(lay.esp_start, 2048);
-        assert_eq!(lay.esp_end, 2048 + 1_048_576 - 1); // 512 MiB
-        assert_eq!(lay.root_start, 2048 + 1_048_576);
+        assert_eq!(lay.bbp_start, 2048);
+        assert_eq!(lay.bbp_end, 2048 + 4096 - 1); // 2 MiB
+        assert_eq!(lay.esp_start, 6144); // 3 MiB
+        assert_eq!(lay.esp_end, 6144 + 1_048_576 - 1); // 512 MiB
+        assert_eq!(lay.root_start, 6144 + 1_048_576);
         assert_eq!(lay.root_end, 41_943_040 - 34); // tail reserved (GPT backup block)
     }
 
@@ -441,20 +479,24 @@ mod tests {
         let lay = build_layout("/dev/sda", 41_943_040).unwrap();
         let cmds = all_partition_commands(&lay);
         assert_eq!(cmds[0], "sgdisk --zap-all /dev/sda");
-        // both partitions are created before any property is attached
-        assert!(cmds[1].contains("--new=1:2048:1050623"));
-        assert!(cmds[2].contains("--new=2:1050624:41943006")); // total-34
+        // all three partitions are created before any property is attached
+        assert!(cmds[1].contains("--new=1:2048:6143")); // 2 MiB bios boot
+        assert!(cmds[2].contains("--new=2:6144:1054719")); // 512 MiB ESP
+        assert!(cmds[3].contains("--new=3:1054720:41943006")); // total-34
         // each property is its own sgdisk invocation (the live image's
         // sgdisk build does not commit --new and --type/--set-boot
         // combined in one invocation)
-        assert!(cmds[3].contains("-t 1:C12A7328-F81F-11D2-BA4B-00A0C93EC93B"));
-        assert!(cmds[4].contains("-c 1:ESP"));
-        assert!(cmds[5].contains("-b 1"));
-        assert!(cmds[6].contains("-t 2:0FC63DAF-8483-4772-8E79-3D69D8477DE4"));
-        assert!(cmds[7].contains("-c 2:root"));
+        assert!(cmds[4].contains("-t 1:21686148-6449-4447-8652-9D952C626A1C"));
+        assert!(cmds[5].contains("-c 1:BIOSBoot"));
+        assert!(cmds[6].contains("-t 2:C12A7328-F81F-11D2-BA4B-00A0C93EC93B"));
+        assert!(cmds[7].contains("-c 2:ESP"));
+        assert!(cmds[8].contains("-b 2"));
+        assert!(cmds[9].contains("-t 3:0FC63DAF-8483-4772-8E79-3D69D8477DE4"));
+        assert!(cmds[10].contains("-c 3:root"));
         // creation commands carry no --type/--set-boot
         assert!(!cmds[1].contains("--type"));
-        assert!(!cmds[2].contains("--set-boot"));
+        assert!(!cmds[2].contains("--type"));
+        assert!(!cmds[3].contains("--set-boot"));
         // no partition command references a protective-MBR step
         assert!(!cmds.iter().any(|c| c.contains("protective")));
     }
@@ -463,8 +505,8 @@ mod tests {
     fn format_specs_use_correct_device_nodes() {
         let lay = build_layout("/dev/nvme0n1", 41_943_040).unwrap();
         let fmt = format_specs(&lay, "GOZJARO_EFI", "GOZJARO_ROOT");
-        assert!(fmt[0].contains("/dev/nvme0n1p1"));
-        assert!(fmt[1].contains("/dev/nvme0n1p2"));
+        assert!(fmt[0].contains("/dev/nvme0n1p2")); // ESP is p2 now
+        assert!(fmt[1].contains("/dev/nvme0n1p3")); // root is p3
         assert!(fmt[0].starts_with("mkfs.vfat"));
         assert!(fmt[1].starts_with("mkfs.ext4"));
     }

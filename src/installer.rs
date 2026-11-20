@@ -882,16 +882,20 @@ mod tests {
         assert!(pos("mkfs.ext4") < pos("blkid"));
         // the sgdisk zap is the very first sgdisk invocation
         let sgdiks: Vec<_> = inst.audit.iter().filter(|c| c[0] == "sgdisk").collect();
-        // zap + 2 creates + 5 single-property calls (-t/-c/-b), one per
-        // invocation because the live image's sgdisk build does not
-        // commit combined --new+--type/--set-boot
-        assert_eq!(sgdiks.len(), 8);
+        // zap + 3 creates (biosboot/esp/root) + 7 single-property calls
+        // (-t/-c/-b), one per invocation because the live image's sgdisk
+        // build does not commit combined --new+--type/--set-boot
+        assert_eq!(sgdiks.len(), 11);
         assert!(sgdiks[0][1].starts_with("--zap-all"));
         assert!(sgdiks[1][1].starts_with("--new=1:"));
         assert!(sgdiks[2][1].starts_with("--new=2:"));
-        assert_eq!(sgdiks[3][1], "-t");
-        assert!(sgdiks[3][2].starts_with("1:C12A7328"));
-        let trail = inst.audit_trail();
+        assert!(sgdiks[3][1].starts_with("--new=3:"));
+        assert_eq!(sgdiks[4][1], "-t");
+        assert!(sgdiks[4][2].starts_with("1:21686148")); // BIOS Boot part
+        assert!(sgdiks[6][2].starts_with("2:C12A7328")); // ESP type
+        assert_eq!(sgdiks[8][1], "-b");
+        assert_eq!(sgdiks[8][2], "2");
+let trail = inst.audit_trail();
         assert!(trail.contains("$ sgdisk --zap-all /dev/sda"));
     }
 
