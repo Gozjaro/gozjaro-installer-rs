@@ -538,6 +538,43 @@ impl Installer {
         } else {
             format!("{}/lib/modules", state::ROOT_MOUNT)
         };
+        // module-slim live CD: the rootfs carries no kernel modules, so the
+        // target cannot be kitted out from the ISO. Install the linux package
+        // from the gozpak repository instead (vmlinuz + config + full module
+        // tree, versioned names matching kernel_name()).
+        let target_modules = format!("{}/lib/modules", state::ROOT_MOUNT);
+        if !self.dry_run && !Path::new(&target_modules).exists() {
+            self.logl(
+                "info",
+                "live root has no kernel modules (module-slim CD): installing linux from the gozpak repository into the target".to_string(),
+            );
+            self.exec_cmd(
+                &["chroot", state::ROOT_MOUNT, "/usr/bin/gozpak", "get", "linux"],
+                true,
+            )?;
+            let mut kvers: Vec<String> = Vec::new();
+            for entry in std::fs::read_dir(&target_modules)? {
+                if let Ok(entry) = entry {
+                    kvers.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+            let kvers_ref: Vec<&str> = kvers.iter().map(String::as_str).collect();
+            let kver = plan::latest_kver(&kvers_ref)
+                .with_context(|| format!("gozpak reported success but {target_modules} is empty"))?;
+            self.logl("info", format!("kernel {kver} installed into target from repository"));
+            self.state.kver = kver.clone();
+            let kitted = [
+                state::kernel_name(&kver),
+                format!("config-{kver}"),
+            ]
+            .iter()
+            .all(|n| Path::new(&format!("{}/boot/{n}", state::ROOT_MOUNT)).is_file());
+            if kitted {
+                self.logl("done", "kernel and configuration installed into target (repository path)".into());
+                return Ok(());
+            }
+            self.logl("warn", "repository install left /boot incomplete; falling back to ISO copies".to_string());
+        }
         let mut kvers: Vec<String> = Vec::new();
         if !Path::new(&moddir).is_dir() {
             bail!("no {moddir} ({})", if self.dry_run { "source" } else { "target" });
