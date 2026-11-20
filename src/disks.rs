@@ -23,9 +23,21 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// GPT partition type GUIDs (upper-case, canonical).
+///
+/// BBP_GUID is the *GRUB* BIOS-Boot type, NOT the "well-known" Microsoft
+/// `21686148-6449-4447-...` one. GRUB's `gpt_partition_map_embed`
+/// (grub-core/partmap/gpt.c) matches a single constant,
+/// `GRUB_GPT_PARTITION_TYPE_BIOS_BOOT` =
+/// `21686148-6449-6E6F-744E-656564454649` — the bytes spell "Hah!IdOn
+/// TNEEDEFI". Verified empirically against a grub 2.14 install: with the
+/// Microsoft GUID (or the Debian biosboot `E3C9E312-...` alias)
+/// `grub-install --target=i386-pc` reports "this GPT partition label
+/// contains no BIOS Boot Partition; embedding won't be possible" and
+/// refuses blocklists. Only the GRUB GUID is found, after which
+/// "Installation finished. No error reported."
 pub const ESP_GUID: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"; // EFI System
 pub const LINUX_GUID: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"; // Linux filesystem
-pub const BBP_GUID: &str = "21686148-6449-4447-8652-9D952C626A1C";  // BIOS Boot
+pub const BBP_GUID: &str = "21686148-6449-6E6F-744E-656564454649";  // BIOS Boot (GRUB's type)
 
 pub const SECTOR: u64 = 512;
 pub const BBP_START_SECTOR: u64 = 2048; // 1 MiB
@@ -486,7 +498,7 @@ mod tests {
         // each property is its own sgdisk invocation (the live image's
         // sgdisk build does not commit --new and --type/--set-boot
         // combined in one invocation)
-        assert!(cmds[4].contains("-t 1:21686148-6449-4447-8652-9D952C626A1C"));
+        assert!(cmds[4].contains("-t 1:21686148-6449-6E6F-744E-656564454649"));
         assert!(cmds[5].contains("-c 1:BIOSBoot"));
         assert!(cmds[6].contains("-t 2:C12A7328-F81F-11D2-BA4B-00A0C93EC93B"));
         assert!(cmds[7].contains("-c 2:ESP"));
